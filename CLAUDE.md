@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Команды
 
-Запуск всегда из venv:
+Запуск всегда из venv **и из корня проекта** (CWD = `auto_checking_transcript/`). Все `python -m ...` команды используют `from src import ...`, который опирается на CWD в `sys.path`:
 
 ```bash
 source .venv/bin/activate
@@ -20,9 +20,10 @@ source .venv/bin/activate
 | `pip install -r requirements.txt` | поставить зависимости |
 | `python -m src.main` | запустить Telegram-бота (long polling) |
 | `python -m scripts.check_file <path.xlsx>` | прогнать проверку локально без Telegram |
-| `python -m py_compile src/*.py scripts/*.py` | быстрая синтаксическая проверка (тестов пока нет) |
+| `python -m unittest discover tests` | запустить все юнит-тесты |
+| `python -m py_compile src/*.py scripts/*.py tests/*.py` | быстрая синтаксическая проверка |
 
-Тестовых фреймворков и линтеров в проекте сейчас нет — добавлять только если просит пользователь.
+Линтеров пока нет — добавлять только если просит пользователь.
 
 ## Архитектура
 

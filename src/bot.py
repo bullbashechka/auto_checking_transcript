@@ -15,6 +15,7 @@ from telegram.ext import (
 
 from . import checker
 from .config import Settings
+from .llm import LLMClient
 
 log = logging.getLogger(__name__)
 
@@ -26,9 +27,9 @@ WELCOME = (
 
 
 def _is_allowed(user_id: int | None, settings: Settings) -> bool:
-    if not settings.allowed_user_ids:
-        return True  # whitelist пуст — открытый режим (для локальной отладки)
-    return user_id in settings.allowed_user_ids
+    if settings.allow_any:
+        return True
+    return user_id is not None and user_id in settings.allowed_user_ids
 
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -69,14 +70,16 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     progress = await update.message.reply_text("Скачиваю файл…")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir) / doc.file_name
+        safe_name = Path(doc.file_name).name or "uploaded.xlsx"
+        tmp_path = Path(tmpdir) / safe_name
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(tmp_path)
 
         await progress.edit_text("Анализирую содержание, это может занять минуту…")
 
+        llm: LLMClient = _ctx.application.bot_data["llm"]
         try:
-            output_path, report = await checker.process_file(tmp_path, settings)
+            output_path, report = await checker.process_file(tmp_path, llm)
         except Exception as err:  # noqa: BLE001
             log.exception("Processing failed for %s", doc.file_name)
             await progress.edit_text(f"Ошибка при обработке файла: {err}")
@@ -91,6 +94,7 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
 def build_application(settings: Settings) -> Application:
     app = Application.builder().token(settings.telegram_token).build()
     app.bot_data["settings"] = settings
+    app.bot_data["llm"] = LLMClient(settings)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))

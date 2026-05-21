@@ -84,10 +84,6 @@ class LLMClient:
 
     def _parse(self, raw: str, original_content: str) -> CheckResult:
         text = raw.strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:].strip()
         try:
             data = json.loads(text) if text else {}
         except json.JSONDecodeError:
@@ -104,6 +100,10 @@ class LLMClient:
             return CheckResult()
 
         if result.corrected == original_content:
+            log.debug(
+                "LLM returned identical 'corrected' text — dropping changes (%d items)",
+                len(result.changes),
+            )
             result = CheckResult(
                 corrected=None,
                 changes=[],

@@ -11,6 +11,7 @@ from openpyxl.workbook import Workbook
 
 HIGHLIGHT_FILL = PatternFill(start_color="FFFFF2A8", end_color="FFFFF2A8", fill_type="solid")
 WARNING_FILL = PatternFill(start_color="FFFFC7C7", end_color="FFFFC7C7", fill_type="solid")
+COMBINED_FILL = PatternFill(start_color="FFFFB14D", end_color="FFFFB14D", fill_type="solid")
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,7 @@ class Correction:
 
 
 @dataclass(frozen=True)
-class Warning_:
+class WarningCell:
     row_idx: int
     content_col: int
 
@@ -101,19 +102,29 @@ class Warning_:
 def write_result(
     wb: Workbook,
     corrections: list[Correction],
-    warnings: list[Warning_],
+    warnings: list[WarningCell],
     input_path: Path,
     output_dir: Path | None = None,
 ) -> Path:
-    """Apply corrections and warning highlights, then save with derived filename."""
+    """Apply corrections and warning highlights, then save with derived filename.
+
+    Если на одну строку приходится и correction, и warning — используется
+    отдельный COMBINED_FILL, чтобы оба сигнала остались видимы.
+    """
     ws = wb.active
+
+    correction_rows = {c.row_idx for c in corrections}
+    warning_rows = {w.row_idx for w in warnings}
+    combined_rows = correction_rows & warning_rows
 
     for corr in corrections:
         cell = ws.cell(row=corr.row_idx, column=corr.content_col)
         cell.value = corr.new_content
-        cell.fill = HIGHLIGHT_FILL
+        cell.fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
 
     for warn in warnings:
+        if warn.row_idx in combined_rows:
+            continue
         cell = ws.cell(row=warn.row_idx, column=warn.content_col)
         cell.fill = WARNING_FILL
 

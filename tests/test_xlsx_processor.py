@@ -1,0 +1,125 @@
+"""Минимальные тесты на парсер xlsx.
+
+Запуск: `python -m unittest tests.test_xlsx_processor` из корня проекта.
+"""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+from openpyxl import Workbook
+
+from src.xlsx_processor import (
+    COMBINED_FILL,
+    HIGHLIGHT_FILL,
+    WARNING_FILL,
+    Correction,
+    WarningCell,
+    parse,
+    write_result,
+)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SAMPLE = ROOT / "Сайдашев Кирилл Алексеевич.xlsx"
+
+
+class TestParse(unittest.TestCase):
+    def test_real_file_has_expected_entries(self) -> None:
+        if not SAMPLE.exists():
+            self.skipTest(f"Sample file not found: {SAMPLE}")
+
+        _wb, entries, _sheet = parse(SAMPLE)
+
+        self.assertEqual(len(entries), 18, "ожидается 18 строк работ")
+        for e in entries:
+            self.assertTrue(e.contractor, f"row {e.row_idx} без контрагента")
+            self.assertTrue(e.content, f"row {e.row_idx} без содержания")
+            self.assertEqual(e.content_col, 7, "колонка «Содержание» = G")
+
+    def test_contractor_propagates_to_following_rows(self) -> None:
+        if not SAMPLE.exists():
+            self.skipTest(f"Sample file not found: {SAMPLE}")
+
+        _wb, entries, _sheet = parse(SAMPLE)
+        berkat_rows = [e for e in entries if e.contractor == "Беркат"]
+        self.assertEqual(len(berkat_rows), 2, "у Беркат должно быть 2 строки работ подряд")
+
+    def test_raises_when_content_column_missing(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "Контрагент"
+        ws["B1"] = "Дата"
+        with self.assertRaises(ValueError):
+            parse_workbook_via_temp(wb)
+
+
+class TestWriteResult(unittest.TestCase):
+    def test_combined_fill_used_when_row_has_both(self) -> None:
+        wb = _make_minimal_workbook()
+        corrections = [Correction(row_idx=2, content_col=2, new_content="fixed")]
+        warnings = [WarningCell(row_idx=2, content_col=2)]
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "input.xlsx"
+            wb.save(tmp)
+            out = write_result(wb, corrections, warnings, tmp, output_dir=Path(tmpdir))
+            self.assertTrue(out.exists())
+
+            from openpyxl import load_workbook
+
+            written = load_workbook(out)
+            cell = written.active.cell(row=2, column=2)
+            self.assertEqual(cell.value, "fixed")
+            self.assertEqual(cell.fill.start_color.rgb, COMBINED_FILL.start_color.rgb)
+
+    def test_separate_fills_for_separate_rows(self) -> None:
+        wb = _make_minimal_workbook()
+        corrections = [Correction(row_idx=2, content_col=2, new_content="fixed")]
+        warnings = [WarningCell(row_idx=3, content_col=2)]
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "input.xlsx"
+            wb.save(tmp)
+            out = write_result(wb, corrections, warnings, tmp, output_dir=Path(tmpdir))
+
+            from openpyxl import load_workbook
+
+            written = load_workbook(out)
+            self.assertEqual(
+                written.active.cell(row=2, column=2).fill.start_color.rgb,
+                HIGHLIGHT_FILL.start_color.rgb,
+            )
+            self.assertEqual(
+                written.active.cell(row=3, column=2).fill.start_color.rgb,
+                WARNING_FILL.start_color.rgb,
+            )
+
+
+def _make_minimal_workbook() -> Workbook:
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Контрагент"
+    ws["B1"] = "Содержание"
+    ws["A2"] = "ООО Тест"
+    ws["B2"] = "original"
+    ws["A3"] = "Иванов ИП"
+    ws["B3"] = "(чей ПК)"
+    return wb
+
+
+def parse_workbook_via_temp(wb: Workbook):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir) / "input.xlsx"
+        wb.save(tmp)
+        return parse(tmp)
+
+
+if __name__ == "__main__":
+    unittest.main()

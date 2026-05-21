@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import xlsx_processor
-from .config import Settings
 from .llm import CheckResult, LLMClient
-from .xlsx_processor import Correction, WorkEntry, Warning_
+from .xlsx_processor import Correction, WarningCell, WorkEntry
 
 log = logging.getLogger(__name__)
 
@@ -16,8 +15,9 @@ log = logging.getLogger(__name__)
 @dataclass
 class Report:
     total: int
-    corrections: list[tuple[WorkEntry, list[str]]]
-    warnings: list[tuple[WorkEntry, str]]
+    corrections: list[tuple[WorkEntry, list[str]]] = field(default_factory=list)
+    warnings: list[tuple[WorkEntry, str]] = field(default_factory=list)
+    errors: int = 0
 
     def render(self) -> str:
         lines = [
@@ -25,6 +25,8 @@ class Report:
             f"✓ Исправлено: {len(self.corrections)}",
             f"⚠ Предупреждения: {len(self.warnings)}",
         ]
+        if self.errors:
+            lines.append(f"❌ Ошибок LLM (строки пропущены): {self.errors}")
 
         if self.warnings:
             lines.append("")
@@ -44,28 +46,27 @@ class Report:
         return "\n".join(lines)
 
 
-async def process_file(input_path: Path, settings: Settings) -> tuple[Path, Report]:
+async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
     wb, entries, _sheet = xlsx_processor.parse(input_path)
     log.info("Parsed %d work entries from %s", len(entries), input_path.name)
 
-    llm = LLMClient(settings)
     results = await asyncio.gather(
         *(llm.check(e.contractor, e.date, e.time, e.content) for e in entries),
         return_exceptions=True,
     )
 
     corrections: list[Correction] = []
-    warnings: list[Warning_] = []
+    warnings: list[WarningCell] = []
     report_corrections: list[tuple[WorkEntry, list[str]]] = []
     report_warnings: list[tuple[WorkEntry, str]] = []
+    errors = 0
 
     for entry, result in zip(entries, results):
         if isinstance(result, BaseException):
-            log.exception("LLM call failed for row %d: %s", entry.row_idx, result)
+            log.error("LLM call failed for row %d", entry.row_idx, exc_info=result)
+            errors += 1
             continue
-        if not isinstance(result, CheckResult):
-            continue
-        if result.is_empty:
+        if not isinstance(result, CheckResult) or result.is_empty:
             continue
 
         if result.corrected:
@@ -80,14 +81,14 @@ async def process_file(input_path: Path, settings: Settings) -> tuple[Path, Repo
 
         if result.warning:
             warnings.append(
-                Warning_(row_idx=entry.row_idx, content_col=entry.content_col)
+                WarningCell(row_idx=entry.row_idx, content_col=entry.content_col)
             )
             report_warnings.append((entry, result.warning))
 
     output_path = xlsx_processor.write_result(wb, corrections, warnings, input_path)
-    report = Report(
+    return output_path, Report(
         total=len(entries),
         corrections=report_corrections,
         warnings=report_warnings,
+        errors=errors,
     )
-    return output_path, report
