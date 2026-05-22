@@ -11,6 +11,16 @@ from .xlsx_processor import Correction, WarningCell, WorkEntry
 
 log = logging.getLogger(__name__)
 
+_TRAILING_PUNCT = {".", "!", "?", "…"}
+
+
+def _ensure_trailing_dot(text: str) -> tuple[str, bool]:
+    """Гарантирует точку в конце ячейки. Возвращает (новый_текст, была_ли_добавлена)."""
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] in _TRAILING_PUNCT:
+        return text, False
+    return stripped + ".", True
+
 
 @dataclass
 class Report:
@@ -82,18 +92,24 @@ async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
             log.error("LLM call failed for row %d", entry.row_idx, exc_info=result)
             errors += 1
             continue
-        if not isinstance(result, CheckResult) or result.is_empty:
+        if not isinstance(result, CheckResult):
             continue
 
-        if result.corrected:
+        base_text = result.corrected if result.corrected else entry.content
+        final_text, dot_added = _ensure_trailing_dot(base_text)
+        changes = list(result.changes)
+        if dot_added:
+            changes.append("добавлена точка в конце")
+
+        if final_text != entry.content:
             corrections.append(
                 Correction(
                     row_idx=entry.row_idx,
                     content_col=entry.content_col,
-                    new_content=result.corrected,
+                    new_content=final_text,
                 )
             )
-            report_corrections.append((entry, result.changes))
+            report_corrections.append((entry, changes))
 
         if result.warning:
             warnings.append(
