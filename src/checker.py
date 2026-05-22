@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import xlsx_processor
-from .llm import CheckResult, LLMClient
+from .llm import BATCH_SIZE, BatchItem, CheckResult, LLMClient
 from .xlsx_processor import Correction, WarningCell, WorkEntry
 
 log = logging.getLogger(__name__)
@@ -61,25 +61,41 @@ async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
     total = len(entries)
     log.info("Parsed %d work entries from '%s'", total, input_path.name)
 
-    progress_step = max(1, total // 10)  # лог каждые ~10%
-    done = 0
+    batches: list[list[WorkEntry]] = [
+        entries[i : i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)
+    ]
+    total_batches = len(batches)
+    progress_step = max(1, total_batches // 10)
+    done_batches = 0
+    done_entries = 0
 
-    async def _check_with_progress(entry: WorkEntry):
-        nonlocal done
+    async def _run_batch(batch: list[WorkEntry]) -> list[CheckResult | BaseException]:
+        nonlocal done_batches, done_entries
+        items = [
+            BatchItem(id=i, contractor=e.contractor, date=e.date, time=e.time, content=e.content)
+            for i, e in enumerate(batch)
+        ]
         try:
-            return await llm.check(entry.contractor, entry.date, entry.time, entry.content)
+            results: list[CheckResult | BaseException] = list(await llm.check_batch(items))
+        except BaseException as err:  # noqa: BLE001
+            results = [err] * len(batch)
         finally:
-            done += 1
-            if done % progress_step == 0 or done == total:
-                log.info("LLM progress: %d / %d (%.0f%%)", done, total, 100 * done / total)
+            done_batches += 1
+            done_entries += len(batch)
+            if done_batches % progress_step == 0 or done_batches == total_batches:
+                log.info(
+                    "LLM batch progress: %d/%d batches (%d / %d entries, %.0f%%)",
+                    done_batches, total_batches, done_entries, total,
+                    100 * done_entries / total if total else 0,
+                )
+        return results
 
-    results = await asyncio.wait_for(
-        asyncio.gather(
-            *(_check_with_progress(e) for e in entries),
-            return_exceptions=True,
-        ),
+    batch_results = await asyncio.wait_for(
+        asyncio.gather(*(_run_batch(b) for b in batches), return_exceptions=False),
         timeout=600,
     )
+
+    results: list[CheckResult | BaseException] = [r for batch in batch_results for r in batch]
 
     corrections: list[Correction] = []
     warnings: list[WarningCell] = []
