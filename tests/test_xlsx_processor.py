@@ -21,7 +21,7 @@ from src.xlsx_processor import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SAMPLE = ROOT / "Сайдашев Кирилл Алексеевич.xlsx"
+SAMPLE = ROOT / "Сизикова Кристина Андреевна (2).xlsx"
 
 
 class TestParse(unittest.TestCase):
@@ -31,20 +31,36 @@ class TestParse(unittest.TestCase):
 
         _wb, entries, header_row = parse(SAMPLE)
 
-        self.assertEqual(len(entries), 18, "ожидается 18 строк работ")
-        self.assertGreaterEqual(header_row, 1)
+        self.assertEqual(len(entries), 151, "ожидается 151 строка работ")
+        self.assertEqual(header_row, 5, "строка заголовков = 5")
         for e in entries:
             self.assertTrue(e.contractor, f"row {e.row_idx} без контрагента")
             self.assertTrue(e.content, f"row {e.row_idx} без содержания")
-            self.assertEqual(e.content_col, 7, "колонка «Содержание» = G")
+            self.assertTrue(e.date, f"row {e.row_idx} без даты")
+            self.assertEqual(e.content_col, 4, "колонка «Содержание» = D")
 
-    def test_contractor_propagates_to_following_rows(self) -> None:
+    def test_first_entry_fields(self) -> None:
         if not SAMPLE.exists():
             self.skipTest(f"Sample file not found: {SAMPLE}")
 
         _wb, entries, _header = parse(SAMPLE)
-        berkat_rows = [e for e in entries if e.contractor == "Беркат"]
-        self.assertEqual(len(berkat_rows), 2, "у Беркат должно быть 2 строки работ подряд")
+        first = entries[0]
+        self.assertEqual(first.contractor, "Aqua Trade ИП")
+        self.assertEqual(first.date, "14.05.2026")
+        self.assertEqual(first.time, "17:05:00")
+        self.assertTrue(first.content.startswith("Архив ИБ БК"))
+
+    def test_contractor_keeps_for_multiple_dates(self) -> None:
+        if not SAMPLE.exists():
+            self.skipTest(f"Sample file not found: {SAMPLE}")
+
+        _wb, entries, _header = parse(SAMPLE)
+        expert_rows = [e for e in entries if e.contractor == "EXPERT-SK"]
+        self.assertGreaterEqual(
+            len(expert_rows), 3, "у EXPERT-SK должно быть >=3 записей с разными датами"
+        )
+        dates = {e.date for e in expert_rows}
+        self.assertEqual(len(dates), len(expert_rows), "все даты у EXPERT-SK уникальные")
 
     def test_raises_when_content_column_missing(self) -> None:
         wb = Workbook()

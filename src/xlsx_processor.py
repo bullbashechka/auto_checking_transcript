@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -7,6 +8,8 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.workbook import Workbook
+
+DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
 
 HIGHLIGHT_FILL = PatternFill(start_color="FFFFF2A8", end_color="FFFFF2A8", fill_type="solid")
@@ -40,7 +43,13 @@ def _find_content_column(ws) -> tuple[int, int]:
 
 
 def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
-    """Open the workbook, locate the «Содержание» column, walk the two-level table.
+    """Open the workbook, locate the «Содержание» column, walk the three-line layout.
+
+    Каждая работа в файле — это три подряд идущие строки:
+        контрагент (текст в колонке A)
+        дата       (dd.mm.yyyy в колонке A)
+        работа     (время в колонке A, содержание в колонке «Содержание»)
+    У одного контрагента может быть несколько пар «дата + работа» подряд.
 
     Returns (workbook, entries, header_row).
     """
@@ -51,39 +60,35 @@ def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
 
     entries: list[WorkEntry] = []
     current_contractor = ""
+    current_date = ""
 
     for row_idx in range(header_row + 1, ws.max_row + 1):
         col_a = _cell_text(ws.cell(row=row_idx, column=1).value)
         content = _cell_text(ws.cell(row=row_idx, column=content_col).value)
 
-        if not content:
-            if col_a:
-                current_contractor = col_a
+        if not col_a and not content:
             continue
 
-        time_val = ws.cell(row=row_idx, column=3).value
-        time_str = _format_time(time_val)
-
-        entries.append(
-            WorkEntry(
-                contractor=current_contractor,
-                date=col_a,
-                time=time_str,
-                content=content,
-                row_idx=row_idx,
-                content_col=content_col,
+        if content:
+            entries.append(
+                WorkEntry(
+                    contractor=current_contractor,
+                    date=current_date,
+                    time=col_a,
+                    content=content,
+                    row_idx=row_idx,
+                    content_col=content_col,
+                )
             )
-        )
+            continue
+
+        if DATE_RE.match(col_a):
+            current_date = col_a
+        else:
+            current_contractor = col_a
+            current_date = ""
 
     return wb, entries, header_row
-
-
-def _format_time(value: object) -> str:
-    if value is None:
-        return ""
-    if hasattr(value, "strftime"):
-        return value.strftime("%H:%M:%S")
-    return str(value).strip()
 
 
 @dataclass(frozen=True)

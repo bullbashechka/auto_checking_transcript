@@ -48,11 +48,27 @@ class Report:
 
 async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
     wb, entries, header_row = xlsx_processor.parse(input_path)
-    log.info("Parsed %d work entries from %s", len(entries), input_path.name)
+    total = len(entries)
+    log.info("Parsed %d work entries from '%s'", total, input_path.name)
 
-    results = await asyncio.gather(
-        *(llm.check(e.contractor, e.date, e.time, e.content) for e in entries),
-        return_exceptions=True,
+    progress_step = max(1, total // 10)  # лог каждые ~10%
+    done = 0
+
+    async def _check_with_progress(entry: WorkEntry):
+        nonlocal done
+        try:
+            return await llm.check(entry.contractor, entry.date, entry.time, entry.content)
+        finally:
+            done += 1
+            if done % progress_step == 0 or done == total:
+                log.info("LLM progress: %d / %d (%.0f%%)", done, total, 100 * done / total)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(_check_with_progress(e) for e in entries),
+            return_exceptions=True,
+        ),
+        timeout=600,
     )
 
     corrections: list[Correction] = []

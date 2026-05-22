@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 from telegram import Update
@@ -67,37 +68,81 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Нужен файл .xlsx — пришли табель в этом формате.")
         return
 
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    size_kb = (doc.file_size or 0) / 1024
+    log.info(
+        "Received xlsx '%s' (%.1f KB) from user=%s chat=%s",
+        doc.file_name, size_kb, user_id, chat_id,
+    )
+
     progress = await update.message.reply_text("Скачиваю файл…")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         safe_name = Path(doc.file_name).name or "uploaded.xlsx"
         tmp_path = Path(tmpdir) / safe_name
+
+        t0 = time.monotonic()
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(tmp_path)
+        t_download = time.monotonic() - t0
+        log.info("Downloaded '%s' in %.2fs", doc.file_name, t_download)
 
         await progress.edit_text("Анализирую содержание, это может занять минуту…")
+        log.info("Starting LLM check ('%s')", doc.file_name)
 
         llm: LLMClient = _ctx.application.bot_data["llm"]
+        t0 = time.monotonic()
         try:
             output_path, report = await checker.process_file(tmp_path, llm)
         except Exception as err:  # noqa: BLE001
-            log.exception("Processing failed for %s", doc.file_name)
+            log.exception("Processing failed for '%s' (after %.2fs)", doc.file_name, time.monotonic() - t0)
             await progress.edit_text(f"Ошибка при обработке файла: {err}")
             return
 
-        await progress.edit_text(report.render())
+        t_llm = time.monotonic() - t0
+        out_size_kb = output_path.stat().st_size / 1024
+        log.info(
+            "LLM done in %.2fs: total=%d, corrections=%d, warnings=%d, errors=%d; output=%.1f KB",
+            t_llm, report.total, len(report.corrections),
+            len(report.warnings), report.errors, out_size_kb,
+        )
 
+        t0 = time.monotonic()
+        await progress.edit_text(report.render())
+        log.info("Report message sent in %.2fs, uploading xlsx (%.1f KB)", time.monotonic() - t0, out_size_kb)
+
+        t0 = time.monotonic()
         with output_path.open("rb") as f:
             await update.message.reply_document(document=f, filename=output_path.name)
+        log.info("Document delivered to user=%s in %.2fs", user_id, time.monotonic() - t0)
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error in handler", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                f"Что-то пошло не так: {ctx.error}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def build_application(settings: Settings) -> Application:
-    app = Application.builder().token(settings.telegram_token).build()
+    app = (
+        Application.builder()
+        .token(settings.telegram_token)
+        .read_timeout(60)
+        .write_timeout(120)
+        .connect_timeout(30)
+        .build()
+    )
     app.bot_data["settings"] = settings
     app.bot_data["llm"] = LLMClient(settings)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_error_handler(on_error)
 
     return app
