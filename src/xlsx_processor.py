@@ -39,10 +39,10 @@ def _find_content_column(ws) -> tuple[int, int]:
     raise ValueError("Не найдена колонка «Содержание» в первых 10 строках листа")
 
 
-def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], str]:
+def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
     """Open the workbook, locate the «Содержание» column, walk the two-level table.
 
-    Returns (workbook, entries, sheet_name).
+    Returns (workbook, entries, header_row).
     """
     wb = load_workbook(path)
     ws = wb.active
@@ -75,7 +75,7 @@ def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], str]:
             )
         )
 
-    return wb, entries, ws.title
+    return wb, entries, header_row
 
 
 def _format_time(value: object) -> str:
@@ -104,29 +104,37 @@ def write_result(
     corrections: list[Correction],
     warnings: list[WarningCell],
     input_path: Path,
+    header_row: int,
     output_dir: Path | None = None,
 ) -> Path:
-    """Apply corrections and warning highlights, then save with derived filename.
+    """Write corrections to a new rightmost column, highlight original + new cells.
 
-    Если на одну строку приходится и correction, и warning — используется
-    отдельный COMBINED_FILL, чтобы оба сигнала остались видимы.
+    Оригинальная ячейка «Содержание» не перезаписывается. Исправленный текст
+    пишется в новую колонку справа от всех существующих; обе ячейки
+    подсвечиваются. Если на строку пришло и исправление, и warning —
+    используется COMBINED_FILL.
     """
     ws = wb.active
+
+    new_col = ws.max_column + 1
+    ws.cell(row=header_row, column=new_col).value = "Исправленное содержание"
 
     correction_rows = {c.row_idx for c in corrections}
     warning_rows = {w.row_idx for w in warnings}
     combined_rows = correction_rows & warning_rows
 
     for corr in corrections:
-        cell = ws.cell(row=corr.row_idx, column=corr.content_col)
-        cell.value = corr.new_content
-        cell.fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
+        fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
+        new_cell = ws.cell(row=corr.row_idx, column=new_col)
+        new_cell.value = corr.new_content
+        new_cell.fill = fill
+        ws.cell(row=corr.row_idx, column=corr.content_col).fill = fill
 
     for warn in warnings:
         if warn.row_idx in combined_rows:
             continue
-        cell = ws.cell(row=warn.row_idx, column=warn.content_col)
-        cell.fill = WARNING_FILL
+        ws.cell(row=warn.row_idx, column=warn.content_col).fill = WARNING_FILL
+        ws.cell(row=warn.row_idx, column=new_col).fill = WARNING_FILL
 
     stem = input_path.stem
     suffix = date.today().strftime("%Y-%m-%d")

@@ -47,7 +47,7 @@ class Report:
 
 
 async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
-    wb, entries, _sheet = xlsx_processor.parse(input_path)
+    wb, entries, header_row = xlsx_processor.parse(input_path)
     log.info("Parsed %d work entries from %s", len(entries), input_path.name)
 
     results = await asyncio.gather(
@@ -85,7 +85,7 @@ async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
             )
             report_warnings.append((entry, result.warning))
 
-    output_path = xlsx_processor.write_result(wb, corrections, warnings, input_path)
+    output_path = xlsx_processor.write_result(wb, corrections, warnings, input_path, header_row)
     return output_path, Report(
         total=len(entries),
         corrections=report_corrections,

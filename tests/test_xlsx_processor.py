@@ -29,9 +29,10 @@ class TestParse(unittest.TestCase):
         if not SAMPLE.exists():
             self.skipTest(f"Sample file not found: {SAMPLE}")
 
-        _wb, entries, _sheet = parse(SAMPLE)
+        _wb, entries, header_row = parse(SAMPLE)
 
         self.assertEqual(len(entries), 18, "ожидается 18 строк работ")
+        self.assertGreaterEqual(header_row, 1)
         for e in entries:
             self.assertTrue(e.contractor, f"row {e.row_idx} без контрагента")
             self.assertTrue(e.content, f"row {e.row_idx} без содержания")
@@ -41,7 +42,7 @@ class TestParse(unittest.TestCase):
         if not SAMPLE.exists():
             self.skipTest(f"Sample file not found: {SAMPLE}")
 
-        _wb, entries, _sheet = parse(SAMPLE)
+        _wb, entries, _header = parse(SAMPLE)
         berkat_rows = [e for e in entries if e.contractor == "Беркат"]
         self.assertEqual(len(berkat_rows), 2, "у Беркат должно быть 2 строки работ подряд")
 
@@ -65,15 +66,22 @@ class TestWriteResult(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir) / "input.xlsx"
             wb.save(tmp)
-            out = write_result(wb, corrections, warnings, tmp, output_dir=Path(tmpdir))
+            out = write_result(wb, corrections, warnings, tmp, header_row=1, output_dir=Path(tmpdir))
             self.assertTrue(out.exists())
 
             from openpyxl import load_workbook
 
             written = load_workbook(out)
-            cell = written.active.cell(row=2, column=2)
-            self.assertEqual(cell.value, "fixed")
-            self.assertEqual(cell.fill.start_color.rgb, COMBINED_FILL.start_color.rgb)
+            ws = written.active
+            self.assertEqual(ws.cell(row=1, column=3).value, "Исправленное содержание")
+            self.assertEqual(ws.cell(row=2, column=2).value, "original", "оригинал не должен меняться")
+            self.assertEqual(ws.cell(row=2, column=3).value, "fixed")
+            self.assertEqual(
+                ws.cell(row=2, column=2).fill.start_color.rgb, COMBINED_FILL.start_color.rgb
+            )
+            self.assertEqual(
+                ws.cell(row=2, column=3).fill.start_color.rgb, COMBINED_FILL.start_color.rgb
+            )
 
     def test_separate_fills_for_separate_rows(self) -> None:
         wb = _make_minimal_workbook()
@@ -85,18 +93,27 @@ class TestWriteResult(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir) / "input.xlsx"
             wb.save(tmp)
-            out = write_result(wb, corrections, warnings, tmp, output_dir=Path(tmpdir))
+            out = write_result(wb, corrections, warnings, tmp, header_row=1, output_dir=Path(tmpdir))
 
             from openpyxl import load_workbook
 
             written = load_workbook(out)
+            ws = written.active
+            self.assertEqual(ws.cell(row=2, column=2).value, "original")
+            self.assertEqual(ws.cell(row=2, column=3).value, "fixed")
             self.assertEqual(
-                written.active.cell(row=2, column=2).fill.start_color.rgb,
-                HIGHLIGHT_FILL.start_color.rgb,
+                ws.cell(row=2, column=2).fill.start_color.rgb, HIGHLIGHT_FILL.start_color.rgb
             )
             self.assertEqual(
-                written.active.cell(row=3, column=2).fill.start_color.rgb,
-                WARNING_FILL.start_color.rgb,
+                ws.cell(row=2, column=3).fill.start_color.rgb, HIGHLIGHT_FILL.start_color.rgb
+            )
+            self.assertEqual(ws.cell(row=3, column=2).value, "(чей ПК)")
+            self.assertIsNone(ws.cell(row=3, column=3).value, "новая колонка пустая для warning")
+            self.assertEqual(
+                ws.cell(row=3, column=2).fill.start_color.rgb, WARNING_FILL.start_color.rgb
+            )
+            self.assertEqual(
+                ws.cell(row=3, column=3).fill.start_color.rgb, WARNING_FILL.start_color.rgb
             )
 
 
