@@ -3,9 +3,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import PatternFill
 from openpyxl.workbook import Workbook
 
@@ -15,6 +18,28 @@ DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 HIGHLIGHT_FILL = PatternFill(start_color="FFFFF2A8", end_color="FFFFF2A8", fill_type="solid")
 WARNING_FILL = PatternFill(start_color="FFFFC7C7", end_color="FFFFC7C7", fill_type="solid")
 COMBINED_FILL = PatternFill(start_color="FFFFB14D", end_color="FFFFB14D", fill_type="solid")
+
+_DIFF_FONT = InlineFont(color="FFCC0000")
+
+
+def _build_diff_rich_text(original: str, corrected: str) -> CellRichText | str:
+    """Возвращает CellRichText с красным шрифтом на изменённых/вставленных фрагментах.
+    Если изменений нет (тексты совпадают) — возвращает обычную строку."""
+    matcher = SequenceMatcher(a=original, b=corrected, autojunk=False)
+    parts: list[str | TextBlock] = []
+    for op, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if j1 == j2:
+            continue
+        chunk = corrected[j1:j2]
+        if op == "equal":
+            parts.append(chunk)
+        else:
+            parts.append(TextBlock(_DIFF_FONT, chunk))
+    if not parts:
+        return ""
+    if len(parts) == 1 and isinstance(parts[0], str):
+        return parts[0]
+    return CellRichText(parts)
 
 
 @dataclass(frozen=True)
@@ -99,6 +124,7 @@ def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
 class Correction:
     row_idx: int
     content_col: int
+    original_content: str
     new_content: str
 
 
@@ -135,7 +161,7 @@ def write_result(
     for corr in corrections:
         fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
         new_cell = ws.cell(row=corr.row_idx, column=new_col)
-        new_cell.value = corr.new_content
+        new_cell.value = _build_diff_rich_text(corr.original_content, corr.new_content)
         new_cell.fill = fill
         ws.cell(row=corr.row_idx, column=corr.content_col).fill = fill
 

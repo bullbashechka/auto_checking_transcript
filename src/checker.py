@@ -122,6 +122,7 @@ async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
                 Correction(
                     row_idx=entry.row_idx,
                     content_col=entry.content_col,
+                    original_content=entry.content,
                     new_content=final_text,
                 )
             )

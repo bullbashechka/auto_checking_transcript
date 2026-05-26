@@ -74,7 +74,9 @@ class TestParse(unittest.TestCase):
 class TestWriteResult(unittest.TestCase):
     def test_combined_fill_used_when_row_has_both(self) -> None:
         wb = _make_minimal_workbook()
-        corrections = [Correction(row_idx=2, content_col=2, new_content="fixed")]
+        corrections = [
+            Correction(row_idx=2, content_col=2, original_content="original", new_content="fixed")
+        ]
         warnings = [WarningCell(row_idx=2, content_col=2)]
 
         import tempfile
@@ -101,7 +103,9 @@ class TestWriteResult(unittest.TestCase):
 
     def test_separate_fills_for_separate_rows(self) -> None:
         wb = _make_minimal_workbook()
-        corrections = [Correction(row_idx=2, content_col=2, new_content="fixed")]
+        corrections = [
+            Correction(row_idx=2, content_col=2, original_content="original", new_content="fixed")
+        ]
         warnings = [WarningCell(row_idx=3, content_col=2)]
 
         import tempfile
@@ -131,6 +135,36 @@ class TestWriteResult(unittest.TestCase):
             self.assertEqual(
                 ws.cell(row=3, column=3).fill.start_color.rgb, WARNING_FILL.start_color.rgb
             )
+
+
+    def test_corrected_column_uses_rich_text_with_red_runs(self) -> None:
+        wb = _make_minimal_workbook()
+        corrections = [
+            Correction(
+                row_idx=2, content_col=2,
+                original_content="обновлене иб", new_content="обновление ИБ",
+            )
+        ]
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "input.xlsx"
+            wb.save(tmp)
+            out = write_result(wb, corrections, [], tmp, header_row=1, output_dir=Path(tmpdir))
+
+            from openpyxl import load_workbook
+            from openpyxl.cell.rich_text import CellRichText, TextBlock
+
+            written = load_workbook(out, rich_text=True)
+            ws = written.active
+            value = ws.cell(row=2, column=3).value
+            self.assertIsInstance(value, CellRichText)
+            red_blocks = [
+                p for p in value
+                if isinstance(p, TextBlock) and p.font.color and p.font.color.rgb == "FFCC0000"
+            ]
+            self.assertTrue(red_blocks, "должны быть красные TextBlock'и для изменённых фрагментов")
 
 
 def _make_minimal_workbook() -> Workbook:
