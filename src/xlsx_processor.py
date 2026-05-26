@@ -64,7 +64,11 @@ def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
 
     for row_idx in range(header_row + 1, ws.max_row + 1):
         col_a = _cell_text(ws.cell(row=row_idx, column=1).value)
-        content = _cell_text(ws.cell(row=row_idx, column=content_col).value)
+        content_cell = ws.cell(row=row_idx, column=content_col)
+        raw_value = content_cell.value
+        if isinstance(raw_value, str) and raw_value != raw_value.rstrip():
+            content_cell.value = raw_value.rstrip()
+        content = _cell_text(raw_value)
 
         if not col_a and not content:
             continue
