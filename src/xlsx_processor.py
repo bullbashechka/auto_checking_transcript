@@ -20,17 +20,21 @@ WARNING_FILL = PatternFill(start_color="FFFFC7C7", end_color="FFFFC7C7", fill_ty
 COMBINED_FILL = PatternFill(start_color="FFFFB14D", end_color="FFFFB14D", fill_type="solid")
 
 _DIFF_FONT = InlineFont(color="FFCC0000")
+_TOKEN_RE = re.compile(r"\S+|\s+")
 
 
 def _build_diff_rich_text(original: str, corrected: str) -> CellRichText | str:
-    """Возвращает CellRichText с красным шрифтом на изменённых/вставленных фрагментах.
-    Если изменений нет (тексты совпадают) — возвращает обычную строку."""
-    matcher = SequenceMatcher(a=original, b=corrected, autojunk=False)
+    """Возвращает CellRichText с красным шрифтом на изменённых/вставленных словах.
+    Diff пословный: токен — это «непробельный» кусок (слово с прилипшей пунктуацией)
+    или «пробельный» кусок. Слово целиком становится красным, если оно поменялось."""
+    a_tokens = _TOKEN_RE.findall(original)
+    b_tokens = _TOKEN_RE.findall(corrected)
+    matcher = SequenceMatcher(a=a_tokens, b=b_tokens, autojunk=False)
     parts: list[str | TextBlock] = []
     for op, _i1, _i2, j1, j2 in matcher.get_opcodes():
         if j1 == j2:
             continue
-        chunk = corrected[j1:j2]
+        chunk = "".join(b_tokens[j1:j2])
         if op == "equal":
             parts.append(chunk)
         else:

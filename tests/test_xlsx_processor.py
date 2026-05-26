@@ -165,6 +165,9 @@ class TestWriteResult(unittest.TestCase):
                 if isinstance(p, TextBlock) and p.font.color and p.font.color.rgb == "FFCC0000"
             ]
             self.assertTrue(red_blocks, "должны быть красные TextBlock'и для изменённых фрагментов")
+            red_text = "".join(b.text for b in red_blocks)
+            self.assertIn("обновление", red_text, "слово целиком должно быть красным при пословном diff")
+            self.assertIn("ИБ", red_text)
 
 
 def _make_minimal_workbook() -> Workbook:
