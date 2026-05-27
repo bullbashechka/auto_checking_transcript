@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from . import xlsx_processor
 from .llm import BATCH_SIZE, BatchItem, CheckResult, LLMClient
@@ -12,6 +13,8 @@ from .xlsx_processor import Correction, WarningCell, WorkEntry
 log = logging.getLogger(__name__)
 
 _TRAILING_PUNCT = {".", "!", "?", "…"}
+
+ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
 
 def _ensure_trailing_dot(text: str) -> tuple[str, bool]:
@@ -56,7 +59,11 @@ class Report:
         return "\n".join(lines)
 
 
-async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
+async def process_file(
+    input_path: Path,
+    llm: LLMClient,
+    on_progress: ProgressCallback | None = None,
+) -> tuple[Path, Report]:
     wb, entries, header_row = xlsx_processor.parse(input_path)
     total = len(entries)
     log.info("Parsed %d work entries from '%s'", total, input_path.name)
@@ -88,6 +95,11 @@ async def process_file(input_path: Path, llm: LLMClient) -> tuple[Path, Report]:
                     done_batches, total_batches, done_entries, total,
                     100 * done_entries / total if total else 0,
                 )
+            if on_progress is not None:
+                try:
+                    await on_progress(done_batches, total_batches, done_entries, total)
+                except Exception:  # noqa: BLE001
+                    log.exception("progress callback failed")
         return results
 
     batch_results = await asyncio.wait_for(

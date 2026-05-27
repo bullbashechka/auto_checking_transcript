@@ -90,10 +90,31 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         await progress.edit_text("Анализирую содержание, это может занять минуту…")
         log.info("Starting LLM check ('%s')", doc.file_name)
 
+        last_edit_ts = 0.0
+        last_percent = -1
+
+        async def on_progress(done_b: int, total_b: int, done_e: int, total_e: int) -> None:
+            nonlocal last_edit_ts, last_percent
+            percent = int(100 * done_e / total_e) if total_e else 0
+            now = time.monotonic()
+            is_final = done_b == total_b
+            if percent == last_percent:
+                return
+            if not is_final and (now - last_edit_ts) < 2.0:
+                return
+            last_edit_ts = now
+            last_percent = percent
+            try:
+                await progress.edit_text(
+                    f"Анализирую содержание… {done_e}/{total_e} ({percent}%)"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
         llm: LLMClient = _ctx.application.bot_data["llm"]
         t0 = time.monotonic()
         try:
-            output_path, report = await checker.process_file(tmp_path, llm)
+            output_path, report = await checker.process_file(tmp_path, llm, on_progress=on_progress)
         except Exception as err:  # noqa: BLE001
             log.exception("Processing failed for '%s' (after %.2fs)", doc.file_name, time.monotonic() - t0)
             await progress.edit_text(f"Ошибка при обработке файла: {err}")
