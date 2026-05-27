@@ -4,9 +4,11 @@ import asyncio
 import logging
 import tempfile
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, Document, Message, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,14 +27,35 @@ WELCOME = (
     "Привет! Я проверяю табели учёта рабочего времени.\n\n"
     "Отправь мне xlsx-файл — в ответ верну исправленную версию "
     "и список найденных опечаток/предупреждений.\n\n"
-    "/cancel — отменить текущую обработку."
+    "Можно прислать несколько файлов подряд — встанут в очередь.\n"
+    "/cancel — отменить текущую обработку и очистить очередь."
 )
+
+
+@dataclass
+class QueuedItem:
+    update: Update
+    doc: Document
+    progress: Message
+    user_id: int
+    queued_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class ChatQueue:
+    items: deque[QueuedItem] = field(default_factory=deque)
+    worker: asyncio.Task[None] | None = None
 
 
 def _is_allowed(user_id: int | None, settings: Settings) -> bool:
     if settings.allow_any:
         return True
     return user_id is not None and user_id in settings.allowed_user_ids
+
+
+def _get_chat_queue(app: Application, chat_id: int) -> ChatQueue:
+    state: dict[int, ChatQueue] = app.bot_data.setdefault("queues", {})
+    return state.setdefault(chat_id, ChatQueue())
 
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -57,11 +80,12 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
-    tasks: dict[int, asyncio.Task] = _ctx.application.bot_data.setdefault("tasks", {})
-    task = tasks.get(chat_id)
-    if task and not task.done():
-        task.cancel()
-        await update.message.reply_text("Отменяю обработку…")
+    chat = _get_chat_queue(_ctx.application, chat_id)
+    if chat.worker and not chat.worker.done():
+        pending = len(chat.items)
+        chat.worker.cancel()
+        suffix = f" + {pending} в очереди" if pending else ""
+        await update.message.reply_text(f"Отменяю текущую обработку{suffix}…")
     else:
         await update.message.reply_text("Сейчас ничего не обрабатывается.")
 
@@ -73,9 +97,7 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
 
     if not _is_allowed(user_id, settings):
-        await update.message.reply_text(
-            f"У тебя нет доступа. Твой Telegram ID: {user_id}."
-        )
+        await update.message.reply_text(f"У тебя нет доступа. Твой Telegram ID: {user_id}.")
         return
 
     doc = update.message.document
@@ -83,109 +105,166 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Нужен файл .xlsx — пришли табель в этом формате.")
         return
 
-    chat_id = update.effective_chat.id if update.effective_chat else None
+    if not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
     size_kb = (doc.file_size or 0) / 1024
     log.info(
         "Received xlsx '%s' (%.1f KB) from user=%s chat=%s",
         doc.file_name, size_kb, user_id, chat_id,
     )
 
-    tasks: dict[int, asyncio.Task] = _ctx.application.bot_data.setdefault("tasks", {})
-    if chat_id is not None:
-        existing = tasks.get(chat_id)
-        if existing and not existing.done():
-            await update.message.reply_text(
-                "Уже обрабатываю предыдущий файл. Отправь /cancel чтобы отменить."
-            )
-            return
-        current = asyncio.current_task()
-        if current is not None:
-            tasks[chat_id] = current
+    chat = _get_chat_queue(_ctx.application, chat_id)
+    worker_busy = chat.worker is not None and not chat.worker.done()
+    position = len(chat.items) + (1 if worker_busy else 0) + 1
 
-    progress = await update.message.reply_text("Скачиваю файл…")
+    if position == 1:
+        progress = await update.message.reply_text("Скачиваю файл…")
+    else:
+        progress = await update.message.reply_text(
+            f"Принято, в очереди. Позиция: {position}."
+        )
 
+    chat.items.append(
+        QueuedItem(update=update, doc=doc, progress=progress, user_id=user_id)
+    )
+
+    if chat.worker is None or chat.worker.done():
+        chat.worker = asyncio.create_task(_worker(_ctx.application, chat_id))
+
+
+async def _worker(app: Application, chat_id: int) -> None:
+    chat = _get_chat_queue(app, chat_id)
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            safe_name = Path(doc.file_name).name or "uploaded.xlsx"
-            tmp_path = Path(tmpdir) / safe_name
-
-            t0 = time.monotonic()
-            tg_file = await doc.get_file()
-            await tg_file.download_to_drive(tmp_path)
-            t_download = time.monotonic() - t0
-            log.info("Downloaded '%s' in %.2fs", doc.file_name, t_download)
-
-            await progress.edit_text("Анализирую содержание, это может занять минуту…")
-            log.info("Starting LLM check ('%s')", doc.file_name)
-
-            last_edit_ts = 0.0
-            last_percent = -1
-
-            async def on_progress(done_b: int, total_b: int, done_e: int, total_e: int) -> None:
-                nonlocal last_edit_ts, last_percent
-                percent = int(100 * done_e / total_e) if total_e else 0
-                now = time.monotonic()
-                is_final = done_b == total_b
-                if percent == last_percent:
-                    return
-                if not is_final and (now - last_edit_ts) < 2.0:
-                    return
-                last_edit_ts = now
-                last_percent = percent
+        while chat.items:
+            item = chat.items.popleft()
+            try:
+                await _process_one(app, item)
+            except asyncio.CancelledError:
+                log.info(
+                    "Processing cancelled for '%s' (user=%s); draining %d queued",
+                    item.doc.file_name, item.user_id, len(chat.items),
+                )
                 try:
-                    await progress.edit_text(
-                        f"Анализирую содержание… {done_e}/{total_e} ({percent}%)"
-                    )
+                    await asyncio.shield(item.progress.edit_text("Обработка отменена."))
                 except Exception:  # noqa: BLE001
                     pass
-
-            llm: LLMClient = _ctx.application.bot_data["llm"]
-            t0 = time.monotonic()
-            try:
-                output_path, report = await checker.process_file(tmp_path, llm, on_progress=on_progress)
-            except asyncio.CancelledError:
+                while chat.items:
+                    dropped = chat.items.popleft()
+                    try:
+                        await asyncio.shield(
+                            dropped.progress.edit_text("Очередь отменена.")
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 raise
-            except Exception as err:  # noqa: BLE001
-                log.exception("Processing failed for '%s' (after %.2fs)", doc.file_name, time.monotonic() - t0)
-                await progress.edit_text(f"Ошибка при обработке файла: {err}")
-                return
-
-            t_llm = time.monotonic() - t0
-            out_size_kb = output_path.stat().st_size / 1024
-            log.info(
-                "LLM done in %.2fs: total=%d, corrections=%d, warnings=%d, errors=%d; output=%.1f KB",
-                t_llm, report.total, len(report.corrections),
-                len(report.warnings), report.errors, out_size_kb,
-            )
-
-            t0 = time.monotonic()
-            await progress.edit_text(report.render())
-            log.info("Report message sent in %.2fs, uploading xlsx (%.1f KB)", time.monotonic() - t0, out_size_kb)
-
-            t0 = time.monotonic()
-            with output_path.open("rb") as f:
-                await update.message.reply_document(document=f, filename=output_path.name)
-            log.info("Document delivered to user=%s in %.2fs", user_id, time.monotonic() - t0)
-    except asyncio.CancelledError:
-        log.info("Processing cancelled for '%s' (user=%s)", doc.file_name, user_id)
-        try:
-            await asyncio.shield(progress.edit_text("Обработка отменена."))
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                log.exception("Queue item failed for '%s'", item.doc.file_name)
     finally:
-        if chat_id is not None and tasks.get(chat_id) is asyncio.current_task():
-            tasks.pop(chat_id, None)
+        chat.worker = None
+
+
+async def _process_one(app: Application, item: QueuedItem) -> None:
+    update = item.update
+    doc = item.doc
+    progress = item.progress
+    user_id = item.user_id
+    assert update.message is not None
+
+    try:
+        await progress.edit_text("Скачиваю файл…")
+    except Exception:  # noqa: BLE001
+        pass
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        safe_name = Path(doc.file_name or "uploaded.xlsx").name or "uploaded.xlsx"
+        tmp_path = Path(tmpdir) / safe_name
+
+        t0 = time.monotonic()
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(tmp_path)
+        log.info("Downloaded '%s' in %.2fs", doc.file_name, time.monotonic() - t0)
+
+        await progress.edit_text("Анализирую содержание, это может занять минуту…")
+        log.info("Starting LLM check ('%s')", doc.file_name)
+
+        last_edit_ts = 0.0
+        last_percent = -1
+
+        async def on_progress(done_b: int, total_b: int, done_e: int, total_e: int) -> None:
+            nonlocal last_edit_ts, last_percent
+            percent = int(100 * done_e / total_e) if total_e else 0
+            now = time.monotonic()
+            is_final = done_b == total_b
+            if percent == last_percent:
+                return
+            if not is_final and (now - last_edit_ts) < 2.0:
+                return
+            last_edit_ts = now
+            last_percent = percent
+            try:
+                await progress.edit_text(
+                    f"Анализирую содержание… {done_e}/{total_e} ({percent}%)"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        llm: LLMClient = app.bot_data["llm"]
+        t0 = time.monotonic()
+        try:
+            output_path, report = await checker.process_file(
+                tmp_path, llm, on_progress=on_progress
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            log.exception(
+                "Processing failed for '%s' (after %.2fs)",
+                doc.file_name, time.monotonic() - t0,
+            )
+            try:
+                await progress.edit_text(f"Ошибка при обработке файла: {err}")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        t_llm = time.monotonic() - t0
+        out_size_kb = output_path.stat().st_size / 1024
+        log.info(
+            "LLM done in %.2fs: total=%d, corrections=%d, warnings=%d, errors=%d; output=%.1f KB",
+            t_llm, report.total, len(report.corrections),
+            len(report.warnings), report.errors, out_size_kb,
+        )
+
+        await progress.edit_text(report.render())
+
+        with output_path.open("rb") as f:
+            await update.message.reply_document(document=f, filename=output_path.name)
+        log.info("Document delivered to user=%s ('%s')", user_id, doc.file_name)
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error in handler", exc_info=ctx.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                f"Что-то пошло не так: {ctx.error}"
-            )
+            await update.effective_message.reply_text(f"Что-то пошло не так: {ctx.error}")
         except Exception:  # noqa: BLE001
             pass
+
+
+BOT_COMMANDS = [
+    BotCommand("start", "Описание и проверка доступа"),
+    BotCommand("cancel", "Отменить обработку и очистить очередь"),
+    BotCommand("id", "Показать твой Telegram ID"),
+]
+
+
+async def _post_init(app: Application) -> None:
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Bot commands menu synced (%d commands)", len(BOT_COMMANDS))
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to set bot commands menu")
 
 
 def build_application(settings: Settings) -> Application:
@@ -195,6 +274,7 @@ def build_application(settings: Settings) -> Application:
         .read_timeout(60)
         .write_timeout(120)
         .connect_timeout(30)
+        .post_init(_post_init)
         .build()
     )
     app.bot_data["settings"] = settings
