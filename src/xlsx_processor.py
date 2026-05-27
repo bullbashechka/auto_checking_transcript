@@ -1,16 +1,49 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import PatternFill
 from openpyxl.workbook import Workbook
+
+DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
 
 HIGHLIGHT_FILL = PatternFill(start_color="FFFFF2A8", end_color="FFFFF2A8", fill_type="solid")
 WARNING_FILL = PatternFill(start_color="FFFFC7C7", end_color="FFFFC7C7", fill_type="solid")
+COMBINED_FILL = PatternFill(start_color="FFFFB14D", end_color="FFFFB14D", fill_type="solid")
+
+_DIFF_FONT = InlineFont(color="FFCC0000")
+_TOKEN_RE = re.compile(r"\S+|\s+")
+
+
+def _build_diff_rich_text(original: str, corrected: str) -> CellRichText | str:
+    """Возвращает CellRichText с красным шрифтом на изменённых/вставленных словах.
+    Diff пословный: токен — это «непробельный» кусок (слово с прилипшей пунктуацией)
+    или «пробельный» кусок. Слово целиком становится красным, если оно поменялось."""
+    a_tokens = _TOKEN_RE.findall(original)
+    b_tokens = _TOKEN_RE.findall(corrected)
+    matcher = SequenceMatcher(a=a_tokens, b=b_tokens, autojunk=False)
+    parts: list[str | TextBlock] = []
+    for op, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if j1 == j2:
+            continue
+        chunk = "".join(b_tokens[j1:j2])
+        if op == "equal":
+            parts.append(chunk)
+        else:
+            parts.append(TextBlock(_DIFF_FONT, chunk))
+    if not parts:
+        return ""
+    if len(parts) == 1 and isinstance(parts[0], str):
+        return parts[0]
+    return CellRichText(parts)
 
 
 @dataclass(frozen=True)
@@ -38,10 +71,16 @@ def _find_content_column(ws) -> tuple[int, int]:
     raise ValueError("Не найдена колонка «Содержание» в первых 10 строках листа")
 
 
-def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], str]:
-    """Open the workbook, locate the «Содержание» column, walk the two-level table.
+def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], int]:
+    """Open the workbook, locate the «Содержание» column, walk the three-line layout.
 
-    Returns (workbook, entries, sheet_name).
+    Каждая работа в файле — это три подряд идущие строки:
+        контрагент (текст в колонке A)
+        дата       (dd.mm.yyyy в колонке A)
+        работа     (время в колонке A, содержание в колонке «Содержание»)
+    У одного контрагента может быть несколько пар «дата + работа» подряд.
+
+    Returns (workbook, entries, header_row).
     """
     wb = load_workbook(path)
     ws = wb.active
@@ -50,50 +89,51 @@ def parse(path: Path | str) -> tuple[Workbook, list[WorkEntry], str]:
 
     entries: list[WorkEntry] = []
     current_contractor = ""
+    current_date = ""
 
     for row_idx in range(header_row + 1, ws.max_row + 1):
         col_a = _cell_text(ws.cell(row=row_idx, column=1).value)
-        content = _cell_text(ws.cell(row=row_idx, column=content_col).value)
+        content_cell = ws.cell(row=row_idx, column=content_col)
+        raw_value = content_cell.value
+        if isinstance(raw_value, str) and raw_value != raw_value.rstrip():
+            content_cell.value = raw_value.rstrip()
+        content = _cell_text(raw_value)
 
-        if not content:
-            if col_a:
-                current_contractor = col_a
+        if not col_a and not content:
             continue
 
-        time_val = ws.cell(row=row_idx, column=3).value
-        time_str = _format_time(time_val)
-
-        entries.append(
-            WorkEntry(
-                contractor=current_contractor,
-                date=col_a,
-                time=time_str,
-                content=content,
-                row_idx=row_idx,
-                content_col=content_col,
+        if content:
+            entries.append(
+                WorkEntry(
+                    contractor=current_contractor,
+                    date=current_date,
+                    time=col_a,
+                    content=content,
+                    row_idx=row_idx,
+                    content_col=content_col,
+                )
             )
-        )
+            continue
 
-    return wb, entries, ws.title
+        if DATE_RE.match(col_a):
+            current_date = col_a
+        else:
+            current_contractor = col_a
+            current_date = ""
 
-
-def _format_time(value: object) -> str:
-    if value is None:
-        return ""
-    if hasattr(value, "strftime"):
-        return value.strftime("%H:%M:%S")
-    return str(value).strip()
+    return wb, entries, header_row
 
 
 @dataclass(frozen=True)
 class Correction:
     row_idx: int
     content_col: int
+    original_content: str
     new_content: str
 
 
 @dataclass(frozen=True)
-class Warning_:
+class WarningCell:
     row_idx: int
     content_col: int
 
@@ -101,21 +141,39 @@ class Warning_:
 def write_result(
     wb: Workbook,
     corrections: list[Correction],
-    warnings: list[Warning_],
+    warnings: list[WarningCell],
     input_path: Path,
+    header_row: int,
     output_dir: Path | None = None,
 ) -> Path:
-    """Apply corrections and warning highlights, then save with derived filename."""
+    """Write corrections to a new rightmost column, highlight original + new cells.
+
+    Оригинальная ячейка «Содержание» не перезаписывается. Исправленный текст
+    пишется в новую колонку справа от всех существующих; обе ячейки
+    подсвечиваются. Если на строку пришло и исправление, и warning —
+    используется COMBINED_FILL.
+    """
     ws = wb.active
 
+    new_col = ws.max_column + 1
+    ws.cell(row=header_row, column=new_col).value = "Исправленное содержание"
+
+    correction_rows = {c.row_idx for c in corrections}
+    warning_rows = {w.row_idx for w in warnings}
+    combined_rows = correction_rows & warning_rows
+
     for corr in corrections:
-        cell = ws.cell(row=corr.row_idx, column=corr.content_col)
-        cell.value = corr.new_content
-        cell.fill = HIGHLIGHT_FILL
+        fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
+        new_cell = ws.cell(row=corr.row_idx, column=new_col)
+        new_cell.value = _build_diff_rich_text(corr.original_content, corr.new_content)
+        new_cell.fill = fill
+        ws.cell(row=corr.row_idx, column=corr.content_col).fill = fill
 
     for warn in warnings:
-        cell = ws.cell(row=warn.row_idx, column=warn.content_col)
-        cell.fill = WARNING_FILL
+        if warn.row_idx in combined_rows:
+            continue
+        ws.cell(row=warn.row_idx, column=warn.content_col).fill = WARNING_FILL
+        ws.cell(row=warn.row_idx, column=new_col).fill = WARNING_FILL
 
     stem = input_path.stem
     suffix = date.today().strftime("%Y-%m-%d")

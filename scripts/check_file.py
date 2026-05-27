@@ -6,10 +6,9 @@ import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from src import checker
 from src.config import load_settings
+from src.llm import LLMClient
 
 
 async def main() -> None:
@@ -24,8 +23,9 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = load_settings()
+    llm = LLMClient(settings)
 
-    output_path, report = await checker.process_file(input_path, settings)
+    output_path, report = await checker.process_file(input_path, llm)
     print()
     print(report.render())
     print()
