@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import time
@@ -23,7 +24,8 @@ log = logging.getLogger(__name__)
 WELCOME = (
     "Привет! Я проверяю табели учёта рабочего времени.\n\n"
     "Отправь мне xlsx-файл — в ответ верну исправленную версию "
-    "и список найденных опечаток/предупреждений."
+    "и список найденных опечаток/предупреждений.\n\n"
+    "/cancel — отменить текущую обработку."
 )
 
 
@@ -51,6 +53,19 @@ async def cmd_id(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
 
 
+async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
+    tasks: dict[int, asyncio.Task] = _ctx.application.bot_data.setdefault("tasks", {})
+    task = tasks.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("Отменяю обработку…")
+    else:
+        await update.message.reply_text("Сейчас ничего не обрабатывается.")
+
+
 async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user or not update.message.document:
         return
@@ -75,67 +90,91 @@ async def handle_document(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         doc.file_name, size_kb, user_id, chat_id,
     )
 
+    tasks: dict[int, asyncio.Task] = _ctx.application.bot_data.setdefault("tasks", {})
+    if chat_id is not None:
+        existing = tasks.get(chat_id)
+        if existing and not existing.done():
+            await update.message.reply_text(
+                "Уже обрабатываю предыдущий файл. Отправь /cancel чтобы отменить."
+            )
+            return
+        current = asyncio.current_task()
+        if current is not None:
+            tasks[chat_id] = current
+
     progress = await update.message.reply_text("Скачиваю файл…")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        safe_name = Path(doc.file_name).name or "uploaded.xlsx"
-        tmp_path = Path(tmpdir) / safe_name
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            safe_name = Path(doc.file_name).name or "uploaded.xlsx"
+            tmp_path = Path(tmpdir) / safe_name
 
-        t0 = time.monotonic()
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(tmp_path)
-        t_download = time.monotonic() - t0
-        log.info("Downloaded '%s' in %.2fs", doc.file_name, t_download)
+            t0 = time.monotonic()
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(tmp_path)
+            t_download = time.monotonic() - t0
+            log.info("Downloaded '%s' in %.2fs", doc.file_name, t_download)
 
-        await progress.edit_text("Анализирую содержание, это может занять минуту…")
-        log.info("Starting LLM check ('%s')", doc.file_name)
+            await progress.edit_text("Анализирую содержание, это может занять минуту…")
+            log.info("Starting LLM check ('%s')", doc.file_name)
 
-        last_edit_ts = 0.0
-        last_percent = -1
+            last_edit_ts = 0.0
+            last_percent = -1
 
-        async def on_progress(done_b: int, total_b: int, done_e: int, total_e: int) -> None:
-            nonlocal last_edit_ts, last_percent
-            percent = int(100 * done_e / total_e) if total_e else 0
-            now = time.monotonic()
-            is_final = done_b == total_b
-            if percent == last_percent:
-                return
-            if not is_final and (now - last_edit_ts) < 2.0:
-                return
-            last_edit_ts = now
-            last_percent = percent
+            async def on_progress(done_b: int, total_b: int, done_e: int, total_e: int) -> None:
+                nonlocal last_edit_ts, last_percent
+                percent = int(100 * done_e / total_e) if total_e else 0
+                now = time.monotonic()
+                is_final = done_b == total_b
+                if percent == last_percent:
+                    return
+                if not is_final and (now - last_edit_ts) < 2.0:
+                    return
+                last_edit_ts = now
+                last_percent = percent
+                try:
+                    await progress.edit_text(
+                        f"Анализирую содержание… {done_e}/{total_e} ({percent}%)"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            llm: LLMClient = _ctx.application.bot_data["llm"]
+            t0 = time.monotonic()
             try:
-                await progress.edit_text(
-                    f"Анализирую содержание… {done_e}/{total_e} ({percent}%)"
-                )
-            except Exception:  # noqa: BLE001
-                pass
+                output_path, report = await checker.process_file(tmp_path, llm, on_progress=on_progress)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                log.exception("Processing failed for '%s' (after %.2fs)", doc.file_name, time.monotonic() - t0)
+                await progress.edit_text(f"Ошибка при обработке файла: {err}")
+                return
 
-        llm: LLMClient = _ctx.application.bot_data["llm"]
-        t0 = time.monotonic()
+            t_llm = time.monotonic() - t0
+            out_size_kb = output_path.stat().st_size / 1024
+            log.info(
+                "LLM done in %.2fs: total=%d, corrections=%d, warnings=%d, errors=%d; output=%.1f KB",
+                t_llm, report.total, len(report.corrections),
+                len(report.warnings), report.errors, out_size_kb,
+            )
+
+            t0 = time.monotonic()
+            await progress.edit_text(report.render())
+            log.info("Report message sent in %.2fs, uploading xlsx (%.1f KB)", time.monotonic() - t0, out_size_kb)
+
+            t0 = time.monotonic()
+            with output_path.open("rb") as f:
+                await update.message.reply_document(document=f, filename=output_path.name)
+            log.info("Document delivered to user=%s in %.2fs", user_id, time.monotonic() - t0)
+    except asyncio.CancelledError:
+        log.info("Processing cancelled for '%s' (user=%s)", doc.file_name, user_id)
         try:
-            output_path, report = await checker.process_file(tmp_path, llm, on_progress=on_progress)
-        except Exception as err:  # noqa: BLE001
-            log.exception("Processing failed for '%s' (after %.2fs)", doc.file_name, time.monotonic() - t0)
-            await progress.edit_text(f"Ошибка при обработке файла: {err}")
-            return
-
-        t_llm = time.monotonic() - t0
-        out_size_kb = output_path.stat().st_size / 1024
-        log.info(
-            "LLM done in %.2fs: total=%d, corrections=%d, warnings=%d, errors=%d; output=%.1f KB",
-            t_llm, report.total, len(report.corrections),
-            len(report.warnings), report.errors, out_size_kb,
-        )
-
-        t0 = time.monotonic()
-        await progress.edit_text(report.render())
-        log.info("Report message sent in %.2fs, uploading xlsx (%.1f KB)", time.monotonic() - t0, out_size_kb)
-
-        t0 = time.monotonic()
-        with output_path.open("rb") as f:
-            await update.message.reply_document(document=f, filename=output_path.name)
-        log.info("Document delivered to user=%s in %.2fs", user_id, time.monotonic() - t0)
+            await asyncio.shield(progress.edit_text("Обработка отменена."))
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if chat_id is not None and tasks.get(chat_id) is asyncio.current_task():
+            tasks.pop(chat_id, None)
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -163,7 +202,8 @@ def build_application(settings: Settings) -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document, block=False))
     app.add_error_handler(on_error)
 
     return app
