@@ -43,6 +43,34 @@ class TestCheckerBatching(unittest.TestCase):
     def _run(self, coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
+    def test_restores_missing_space_after_sentence_dot(self) -> None:
+        fixed, changed = checker._ensure_space_after_sentence_punctuation(
+            "Первое предложение.меня зовут кирилл"
+        )
+        self.assertTrue(changed)
+        self.assertEqual(fixed, "Первое предложение. меня зовут кирилл")
+
+    def test_collapses_extra_spaces_after_sentence_dot_to_one(self) -> None:
+        fixed, changed = checker._ensure_space_after_sentence_punctuation(
+            "Первое предложение.  Следующее предложение"
+        )
+        self.assertTrue(changed)
+        self.assertEqual(fixed, "Первое предложение. Следующее предложение")
+
+    def test_restores_missing_space_after_other_sentence_punctuation(self) -> None:
+        fixed, changed = checker._ensure_space_after_sentence_punctuation(
+            "Готово!следующее действие?проверить"
+        )
+        self.assertTrue(changed)
+        self.assertEqual(fixed, "Готово! следующее действие? проверить")
+
+    def test_does_not_break_known_dot_abbreviations(self) -> None:
+        fixed, changed = checker._ensure_space_after_sentence_punctuation(
+            "Регистрация физ.лица и рег.номер через т.е.пример"
+        )
+        self.assertFalse(changed)
+        self.assertEqual(fixed, "Регистрация физ.лица и рег.номер через т.е.пример")
+
     def test_batch_size_is_three(self) -> None:
         self.assertEqual(BATCH_SIZE, 3, "размер батча зафиксирован = 3")
 

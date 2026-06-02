@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -13,6 +14,16 @@ from .xlsx_processor import Correction, WarningCell, WorkEntry
 log = logging.getLogger(__name__)
 
 _TRAILING_PUNCT = {".", "!", "?", "…"}
+_SPACE_AFTER_PUNCT_RE = re.compile(r"([.!?…])([ \t]*)([A-Za-zА-Яа-яЁё])")
+_DOT_ABBREVIATIONS_WITHOUT_SPACE = {
+    "рег",
+    "физ",
+    "т",
+    "т.е",
+    "т.д",
+    "т.п",
+    "н-р",
+}
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
@@ -23,6 +34,30 @@ def _ensure_trailing_dot(text: str) -> tuple[str, bool]:
     if not stripped or stripped[-1] in _TRAILING_PUNCT:
         return text, False
     return stripped + ".", True
+
+
+def _ensure_space_after_sentence_punctuation(text: str) -> tuple[str, bool]:
+    """Оставляет один пробел после финальной пунктуации между предложениями."""
+
+    def replace(match: re.Match[str]) -> str:
+        punct = match.group(1)
+        spaces = match.group(2)
+        next_char = match.group(3)
+        if punct == ".":
+            token_start = max(
+                text.rfind(" ", 0, match.start(1)),
+                text.rfind("\n", 0, match.start(1)),
+                text.rfind("\t", 0, match.start(1)),
+            ) + 1
+            token = text[token_start:match.start(1)].strip("«»\"'()[]{}").lower()
+            if token in _DOT_ABBREVIATIONS_WITHOUT_SPACE:
+                return match.group(0)
+        if spaces == " ":
+            return match.group(0)
+        return f"{punct} {next_char}"
+
+    fixed = _SPACE_AFTER_PUNCT_RE.sub(replace, text)
+    return fixed, fixed != text
 
 
 @dataclass
@@ -124,8 +159,11 @@ async def process_file(
             continue
 
         base_text = result.corrected if result.corrected else entry.content
-        final_text, dot_added = _ensure_trailing_dot(base_text)
+        spaced_text, space_added = _ensure_space_after_sentence_punctuation(base_text)
+        final_text, dot_added = _ensure_trailing_dot(spaced_text)
         changes = list(result.changes)
+        if space_added:
+            changes.append("добавлен пробел после знака препинания")
         if dot_added:
             changes.append("добавлена точка в конце")
 
