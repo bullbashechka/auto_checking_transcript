@@ -71,6 +71,20 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(fixed, "Регистрация физ.лица и рег.номер через т.е.пример")
 
+    def test_does_not_insert_space_between_initials(self) -> None:
+        fixed, changed = checker._ensure_space_after_sentence_punctuation(
+            "Настройка пользователя Иванов И.И."
+        )
+        self.assertFalse(changed)
+        self.assertEqual(fixed, "Настройка пользователя Иванов И.И.")
+
+    def test_normalizes_extra_space_between_surname_initials(self) -> None:
+        fixed, changed = checker._normalize_surname_initials(
+            "Настройка пользователя Иванов И. И."
+        )
+        self.assertTrue(changed)
+        self.assertEqual(fixed, "Настройка пользователя Иванов И.И.")
+
     def test_batch_size_is_three(self) -> None:
         self.assertEqual(BATCH_SIZE, 3, "размер батча зафиксирован = 3")
 

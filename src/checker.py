@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 _TRAILING_PUNCT = {".", "!", "?", "…"}
 _SPACE_AFTER_PUNCT_RE = re.compile(r"([.!?…])([ \t]*)([A-Za-zА-Яа-яЁё])")
+_SURNAME_INITIALS_SPACING_RE = re.compile(r"\b([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s+([А-ЯЁ])\.")
 _DOT_ABBREVIATIONS_WITHOUT_SPACE = {
     "рег",
     "физ",
@@ -52,11 +53,20 @@ def _ensure_space_after_sentence_punctuation(text: str) -> tuple[str, bool]:
             token = text[token_start:match.start(1)].strip("«»\"'()[]{}").lower()
             if token in _DOT_ABBREVIATIONS_WITHOUT_SPACE:
                 return match.group(0)
+            raw_token = text[token_start:match.start(1)].strip("«»\"'()[]{}")
+            if len(raw_token) == 1 and raw_token.isupper() and next_char.isupper():
+                return match.group(0)
         if spaces == " ":
             return match.group(0)
         return f"{punct} {next_char}"
 
     fixed = _SPACE_AFTER_PUNCT_RE.sub(replace, text)
+    return fixed, fixed != text
+
+
+def _normalize_surname_initials(text: str) -> tuple[str, bool]:
+    """Убирает лишний пробел между инициалами после фамилии: Иванов И. И. -> Иванов И.И."""
+    fixed = _SURNAME_INITIALS_SPACING_RE.sub(r"\1 \2.\3.", text)
     return fixed, fixed != text
 
 
@@ -160,10 +170,13 @@ async def process_file(
 
         base_text = result.corrected if result.corrected else entry.content
         spaced_text, space_added = _ensure_space_after_sentence_punctuation(base_text)
-        final_text, dot_added = _ensure_trailing_dot(spaced_text)
+        initials_text, initials_normalized = _normalize_surname_initials(spaced_text)
+        final_text, dot_added = _ensure_trailing_dot(initials_text)
         changes = list(result.changes)
         if space_added:
             changes.append("добавлен пробел после знака препинания")
+        if initials_normalized:
+            changes.append("убран лишний пробел между инициалами")
         if dot_added:
             changes.append("добавлена точка в конце")
 
