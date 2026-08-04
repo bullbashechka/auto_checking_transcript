@@ -32,6 +32,19 @@ class TestPromptContract(unittest.TestCase):
             self.prompt,
         )
 
+    def test_contains_bank_brand_normalization_rule(self) -> None:
+        for fragment in (
+            "KaspiBank",
+            "Халык",
+            "kaspi bank",
+            "халык",
+            "kaspi bank, халык",
+            "KaspiBank, Халык",
+            "исключение из правила «собственные имена — символ в символ»",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.prompt)
+
     def test_keeps_json_contract(self) -> None:
         for field in (
             '"id"',
