@@ -34,7 +34,7 @@ _ADDRESS_WITH_SPACES_RE = re.compile(
     rf"(?:(?:{_EMAIL_LOCAL})|(?:https?://)?)"
     rf"(?:{_DOMAIN_LABEL} *\. *)+"
     rf"(?:{_DOMAIN_ZONE_PATTERN})"
-    rf"(?=$|[\s/:?#),;!?])",
+    rf"(?=$|[\s/:?#),;!?.…])",
     re.IGNORECASE,
 )
 _SPACES_AROUND_DOT_RE = re.compile(r" *\. *")

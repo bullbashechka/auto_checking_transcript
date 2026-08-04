@@ -54,6 +54,18 @@ class TestTextNormalization(unittest.TestCase):
         self.assertEqual(fixed, source)
         self.assertEqual(changes, [])
 
+    def test_preserves_addresses_before_terminal_sentence_punctuation(self) -> None:
+        cases = {
+            "Адрес openai.com. Далее": "Адрес openai.com. Далее",
+            "Адрес openai. com. Далее": "Адрес openai.com. Далее",
+            "Адрес https://portal. org/path. Далее": "Адрес https://portal.org/path. Далее",
+            "Адрес user@site. kz. Далее": "Адрес user@site.kz. Далее",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                fixed, _changes = checker._normalize_mechanical_spacing(source)
+                self.assertEqual(fixed, expected)
+
     def test_keeps_sentence_spacing_without_breaking_protected_tokens(self) -> None:
         cases = {
             "Сделано.Следующее": "Сделано. Следующее",
