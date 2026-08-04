@@ -45,6 +45,19 @@ class TestPromptContract(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.prompt)
 
+    def test_contains_year_and_quarter_spacing_rule(self) -> None:
+        for fragment in (
+            "«2026года» → «2026 года»",
+            "«2026 г.» → «2026г.»",
+            "«1квартал» → «1 квартал»",
+            "«2квартала» → «2 квартала»",
+            "«1 кв.» → «1кв.»",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.prompt)
+
+        self.assertNotIn("«1кв.» → «1 кв.»,", self.prompt)
+
     def test_keeps_json_contract(self) -> None:
         for field in (
             '"id"',
