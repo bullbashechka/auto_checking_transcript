@@ -58,6 +58,14 @@ class TestPromptContract(unittest.TestCase):
 
         self.assertNotIn("«1кв.» → «1 кв.»,", self.prompt)
 
+    def test_allows_both_1c_webkassa_spellings(self) -> None:
+        self.assertIn(
+            "«1C:WebKassa» с латинской C и «1С:WebKassa» с кириллической С "
+            "одинаково корректны",
+            self.prompt,
+        )
+        self.assertNotIn("«1C» пишется ЛАТИНИЦЕЙ", self.prompt)
+
     def test_keeps_json_contract(self) -> None:
         for field in (
             '"id"',
