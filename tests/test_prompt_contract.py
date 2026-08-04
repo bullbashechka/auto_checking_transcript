@@ -66,6 +66,24 @@ class TestPromptContract(unittest.TestCase):
         )
         self.assertNotIn("«1C» пишется ЛАТИНИЦЕЙ", self.prompt)
 
+    def test_explicitly_forbids_inflecting_domain_abbreviations(self) -> None:
+        self.assertIn("Все следующие сокращения несклоняемы", self.prompt)
+
+        for abbreviation in (
+            "ИТС", "ЭАВР", "СНТ", "ЭСФ", "ЭЦП", "ЭДО", "ОФД", "ИС",
+            "ИСНА", "КНП", "ГЗ", "БК", "УНФ", "УТ", "КА", "СЛК", "ИБ",
+            "ТМЗ", "ООСМС", "ОСМС", "ВОСМС", "ОПВ", "ОПВР", "СО", "ИПН",
+            "КПН", "НКТ", "НДС", "ФНО", "ОСВ", "НУ", "БУ", "ПР", "ВР",
+            "ФА", "ЛС", "НП", "МРП", "СХ", "ГЕМ", "ВС", "ПК", "ТОО",
+            "ИП", "СБ", "с/б", "ЗП", "з/п", "БЛ", "б/л", "ИИН", "ИНН",
+            "БИН",
+        ):
+            with self.subTest(abbreviation=abbreviation):
+                self.assertIn(f"«{abbreviation}»", self.prompt)
+
+        self.assertIn("не добавляй к ним падежные окончания", self.prompt)
+        self.assertIn("исправляй склонённую форму на исходное сокращение", self.prompt)
+
     def test_keeps_json_contract(self) -> None:
         for field in (
             '"id"',
