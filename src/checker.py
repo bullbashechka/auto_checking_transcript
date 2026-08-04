@@ -25,6 +25,24 @@ _DOT_ABBREVIATIONS_WITHOUT_SPACE = {
     "т.п",
     "н-р",
 }
+_ALLOWED_DOMAIN_ZONES = ("kz", "ru", "com", "org", "net", "рф", "қаз")
+_DOMAIN_LABEL = r"[^\W_](?:(?:[^\W_]|-)*[^\W_])?"
+_EMAIL_LOCAL = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+_DOMAIN_ZONE_PATTERN = "|".join(re.escape(zone) for zone in _ALLOWED_DOMAIN_ZONES)
+_ADDRESS_WITH_SPACES_RE = re.compile(
+    rf"(?<![\w-])"
+    rf"(?:(?:{_EMAIL_LOCAL})|(?:https?://)?)"
+    rf"(?:{_DOMAIN_LABEL} *\. *)+"
+    rf"(?:{_DOMAIN_ZONE_PATTERN})"
+    rf"(?=$|[\s/:?#),;!?.…])",
+    re.IGNORECASE,
+)
+_SPACES_AROUND_DOT_RE = re.compile(r" *\. *")
+_REPEATED_PLAIN_SPACES_RE = re.compile(r" {2,}")
+
+_ADDRESS_SPACING_CHANGE = "исправлены пробелы внутри адреса сайта или email"
+_REPEATED_SPACES_CHANGE = "двойные пробелы заменены одним"
+_SENTENCE_SPACING_CHANGE = "добавлен пробел после знака препинания"
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
@@ -39,12 +57,16 @@ def _ensure_trailing_dot(text: str) -> tuple[str, bool]:
 
 def _ensure_space_after_sentence_punctuation(text: str) -> tuple[str, bool]:
     """Оставляет один пробел после финальной пунктуации между предложениями."""
+    protected_address_spans = _address_spans(text)
 
     def replace(match: re.Match[str]) -> str:
         punct = match.group(1)
         spaces = match.group(2)
         next_char = match.group(3)
         if punct == ".":
+            dot_index = match.start(1)
+            if any(start <= dot_index < end for start, end in protected_address_spans):
+                return match.group(0)
             token_start = max(
                 text.rfind(" ", 0, match.start(1)),
                 text.rfind("\n", 0, match.start(1)),
@@ -64,10 +86,54 @@ def _ensure_space_after_sentence_punctuation(text: str) -> tuple[str, bool]:
     return fixed, fixed != text
 
 
+def _normalize_address_spacing(text: str) -> tuple[str, bool]:
+    def replace(match: re.Match[str]) -> str:
+        return _SPACES_AROUND_DOT_RE.sub(".", match.group(0))
+
+    fixed = _ADDRESS_WITH_SPACES_RE.sub(replace, text)
+    return fixed, fixed != text
+
+
+def _address_spans(text: str) -> list[tuple[int, int]]:
+    return [match.span() for match in _ADDRESS_WITH_SPACES_RE.finditer(text)]
+
+
+def _normalize_mechanical_spacing(text: str) -> tuple[str, list[str]]:
+    changes: list[str] = []
+
+    address_text, address_changed = _normalize_address_spacing(text)
+    if address_changed:
+        changes.append(_ADDRESS_SPACING_CHANGE)
+
+    collapsed_text = _REPEATED_PLAIN_SPACES_RE.sub(" ", address_text)
+    if collapsed_text != address_text:
+        changes.append(_REPEATED_SPACES_CHANGE)
+
+    sentence_text, sentence_changed = _ensure_space_after_sentence_punctuation(
+        collapsed_text
+    )
+    if sentence_changed:
+        changes.append(_SENTENCE_SPACING_CHANGE)
+
+    return sentence_text, changes
+
+
 def _normalize_surname_initials(text: str) -> tuple[str, bool]:
     """Убирает лишний пробел между инициалами после фамилии: Иванов И. И. -> Иванов И.И."""
     fixed = _SURNAME_INITIALS_SPACING_RE.sub(r"\1 \2.\3.", text)
     return fixed, fixed != text
+
+
+def _merge_unique_changes(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for change in group:
+            if change in seen:
+                continue
+            seen.add(change)
+            merged.append(change)
+    return merged
 
 
 @dataclass
@@ -112,6 +178,10 @@ async def process_file(
     wb, entries, header_row = xlsx_processor.parse(input_path)
     total = len(entries)
     log.info("Parsed %d work entries from '%s'", total, input_path.name)
+    normalized_inputs = {
+        entry.row_idx: _normalize_mechanical_spacing(entry.content)
+        for entry in entries
+    }
 
     batches: list[list[WorkEntry]] = [
         entries[i : i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)
@@ -124,8 +194,14 @@ async def process_file(
     async def _run_batch(batch: list[WorkEntry]) -> list[CheckResult | BaseException]:
         nonlocal done_batches, done_entries
         items = [
-            BatchItem(id=i, contractor=e.contractor, date=e.date, time=e.time, content=e.content)
-            for i, e in enumerate(batch)
+            BatchItem(
+                id=i,
+                contractor=entry.contractor,
+                date=entry.date,
+                time=entry.time,
+                content=normalized_inputs[entry.row_idx][0],
+            )
+            for i, entry in enumerate(batch)
         ]
         try:
             results: list[CheckResult | BaseException] = list(await llm.check_batch(items))
@@ -168,17 +244,18 @@ async def process_file(
         if not isinstance(result, CheckResult):
             continue
 
-        base_text = result.corrected if result.corrected else entry.content
-        spaced_text, space_added = _ensure_space_after_sentence_punctuation(base_text)
+        pre_normalized_text, pre_changes = normalized_inputs[entry.row_idx]
+        base_text = result.corrected if result.corrected else pre_normalized_text
+        spaced_text, post_changes = _normalize_mechanical_spacing(base_text)
         initials_text, initials_normalized = _normalize_surname_initials(spaced_text)
         final_text, dot_added = _ensure_trailing_dot(initials_text)
-        changes = list(result.changes)
-        if space_added:
-            changes.append("добавлен пробел после знака препинания")
+        changes = _merge_unique_changes(pre_changes, list(result.changes), post_changes)
         if initials_normalized:
-            changes.append("убран лишний пробел между инициалами")
+            changes = _merge_unique_changes(
+                changes, ["убран лишний пробел между инициалами"]
+            )
         if dot_added:
-            changes.append("добавлена точка в конце")
+            changes = _merge_unique_changes(changes, ["добавлена точка в конце"])
 
         if final_text != entry.content:
             corrections.append(
