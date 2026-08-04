@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -45,7 +46,11 @@ def _make_workbook_with_entries(n: int) -> Path:
 @unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
 class TestCheckerBatching(unittest.TestCase):
     def _run(self, coro):
-        return asyncio.run(coro)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_restores_missing_space_after_sentence_dot(self) -> None:
         fixed, changed = checker._ensure_space_after_sentence_punctuation(
@@ -106,6 +111,19 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertEqual(mock_llm.check_batch.await_count, 4)
         batch_sizes = [len(call.args[0]) for call in mock_llm.check_batch.await_args_list]
         self.assertEqual(sorted(batch_sizes, reverse=True), [3, 3, 3, 1])
+
+    def test_run_preserves_current_event_loop(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            current_loop = asyncio.get_event_loop()
+
+        self._run(asyncio.sleep(0))
+
+        try:
+            current_loop_after_run = asyncio.get_event_loop()
+        except RuntimeError:
+            self.fail("_run cleared the current event loop")
+        self.assertIs(current_loop_after_run, current_loop)
 
     def test_sends_pre_normalized_content_to_llm_and_reports_changes(self) -> None:
         path = _make_workbook_with_contents(["Проверка  openai. com"])
