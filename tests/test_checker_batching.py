@@ -9,28 +9,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 HAS_GENAI = importlib.util.find_spec("google.genai") is not None
 
 if HAS_GENAI:
     from src import checker
     from src.llm import BATCH_SIZE, CheckResult
+    from src.xlsx_processor import HIGHLIGHT_FILL
 
 
-def _make_workbook_with_entries(n: int) -> Path:
-    """Создаёт xlsx в трёхстрочной раскладке с n записями под одним контрагентом."""
+def _make_workbook_with_contents(contents: list[str]) -> Path:
     wb = Workbook()
     ws = wb.active
     ws["A1"] = "Время нач"
     ws["D1"] = "Содержание"
-    ws["A2"] = "ООО Тест"  # контрагент
+    ws["A2"] = "ООО Тест"
     row = 3
-    for i in range(n):
+    for i, content in enumerate(contents):
         ws.cell(row=row, column=1).value = "01.01.2026"
         row += 1
         ws.cell(row=row, column=1).value = f"{9 + i:02d}:00:00"
-        ws.cell(row=row, column=4).value = f"Работа {i}"
+        ws.cell(row=row, column=4).value = content
         row += 1
     tmpdir = tempfile.mkdtemp()
     path = Path(tmpdir) / "input.xlsx"
@@ -38,10 +38,14 @@ def _make_workbook_with_entries(n: int) -> Path:
     return path
 
 
+def _make_workbook_with_entries(n: int) -> Path:
+    return _make_workbook_with_contents([f"Работа {i}" for i in range(n)])
+
+
 @unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
 class TestCheckerBatching(unittest.TestCase):
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_restores_missing_space_after_sentence_dot(self) -> None:
         fixed, changed = checker._ensure_space_after_sentence_punctuation(
@@ -102,6 +106,53 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertEqual(mock_llm.check_batch.await_count, 4)
         batch_sizes = [len(call.args[0]) for call in mock_llm.check_batch.await_args_list]
         self.assertEqual(sorted(batch_sizes, reverse=True), [3, 3, 3, 1])
+
+    def test_sends_pre_normalized_content_to_llm_and_reports_changes(self) -> None:
+        path = _make_workbook_with_contents(["Проверка  openai. com"])
+
+        async def side_effect(items):
+            self.assertEqual(items[0].content, "Проверка openai.com")
+            return [CheckResult()]
+
+        mock_llm = AsyncMock()
+        mock_llm.check_batch.side_effect = side_effect
+        output_path, report = self._run(checker.process_file(path, mock_llm))
+
+        self.assertTrue(output_path.exists())
+        self.assertEqual(len(report.corrections), 1)
+        _entry, changes = report.corrections[0]
+        self.assertIn("исправлены пробелы внутри адреса сайта или email", changes)
+        self.assertIn("двойные пробелы заменены одним", changes)
+        written_wb = load_workbook(output_path)
+        self.assertEqual(
+            written_wb.active["D4"].fill.start_color.rgb,
+            HIGHLIGHT_FILL.start_color.rgb,
+        )
+
+    def test_normalizes_llm_output_and_merges_changes_without_duplicates(self) -> None:
+        path = _make_workbook_with_contents(["Проверка openai. com"])
+
+        async def side_effect(items):
+            self.assertEqual(items[0].content, "Проверка openai.com")
+            return [
+                CheckResult.model_validate(
+                    {
+                        "Исправленное_Содержание": "Проверка openai. com  выполнена",
+                        "Изменения": ["добавлено слово «выполнена»"],
+                    }
+                )
+            ]
+
+        mock_llm = AsyncMock()
+        mock_llm.check_batch.side_effect = side_effect
+        _output_path, report = self._run(checker.process_file(path, mock_llm))
+
+        self.assertEqual(len(report.corrections), 1)
+        _entry, changes = report.corrections[0]
+        self.assertEqual(changes.count("исправлены пробелы внутри адреса сайта или email"), 1)
+        self.assertEqual(changes.count("двойные пробелы заменены одним"), 1)
+        self.assertIn("добавлено слово «выполнена»", changes)
+        self.assertIn("добавлена точка в конце", changes)
 
     def test_preserves_entry_order(self) -> None:
         path = _make_workbook_with_entries(7)

@@ -124,6 +124,18 @@ def _normalize_surname_initials(text: str) -> tuple[str, bool]:
     return fixed, fixed != text
 
 
+def _merge_unique_changes(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for change in group:
+            if change in seen:
+                continue
+            seen.add(change)
+            merged.append(change)
+    return merged
+
+
 @dataclass
 class Report:
     total: int
@@ -166,6 +178,10 @@ async def process_file(
     wb, entries, header_row = xlsx_processor.parse(input_path)
     total = len(entries)
     log.info("Parsed %d work entries from '%s'", total, input_path.name)
+    normalized_inputs = {
+        entry.row_idx: _normalize_mechanical_spacing(entry.content)
+        for entry in entries
+    }
 
     batches: list[list[WorkEntry]] = [
         entries[i : i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)
@@ -178,8 +194,14 @@ async def process_file(
     async def _run_batch(batch: list[WorkEntry]) -> list[CheckResult | BaseException]:
         nonlocal done_batches, done_entries
         items = [
-            BatchItem(id=i, contractor=e.contractor, date=e.date, time=e.time, content=e.content)
-            for i, e in enumerate(batch)
+            BatchItem(
+                id=i,
+                contractor=entry.contractor,
+                date=entry.date,
+                time=entry.time,
+                content=normalized_inputs[entry.row_idx][0],
+            )
+            for i, entry in enumerate(batch)
         ]
         try:
             results: list[CheckResult | BaseException] = list(await llm.check_batch(items))
@@ -222,17 +244,18 @@ async def process_file(
         if not isinstance(result, CheckResult):
             continue
 
-        base_text = result.corrected if result.corrected else entry.content
-        spaced_text, space_added = _ensure_space_after_sentence_punctuation(base_text)
+        pre_normalized_text, pre_changes = normalized_inputs[entry.row_idx]
+        base_text = result.corrected if result.corrected else pre_normalized_text
+        spaced_text, post_changes = _normalize_mechanical_spacing(base_text)
         initials_text, initials_normalized = _normalize_surname_initials(spaced_text)
         final_text, dot_added = _ensure_trailing_dot(initials_text)
-        changes = list(result.changes)
-        if space_added:
-            changes.append("добавлен пробел после знака препинания")
+        changes = _merge_unique_changes(pre_changes, list(result.changes), post_changes)
         if initials_normalized:
-            changes.append("убран лишний пробел между инициалами")
+            changes = _merge_unique_changes(
+                changes, ["убран лишний пробел между инициалами"]
+            )
         if dot_added:
-            changes.append("добавлена точка в конце")
+            changes = _merge_unique_changes(changes, ["добавлена точка в конце"])
 
         if final_text != entry.content:
             corrections.append(
