@@ -4,28 +4,23 @@
 
 ---
 
-## Шаг 1. Получить ключ Google Gemini API
+## Шаг 1. Настроить OpenAI API
 
 Это самое важное — без этого ключа бот не сможет проверять текст.
 
-1. Открой [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey).
-2. Залогинься своим Google-аккаунтом (тот же, что для Gmail подойдёт).
-3. Нажми **«Create API key»** (или «Создать ключ API»).
-4. Если предложит выбрать Google Cloud проект — выбери любой свой существующий или нажми **«Create API key in new project»**.
+1. Открой [Billing overview](https://platform.openai.com/settings/organization/billing/overview) и добавь способ оплаты.
+2. Купи API-кредиты через **Add to balance**. Автопополнение можно отключить или ограничить месячным лимитом.
+3. Проверь остаток на [Credit grants](https://platform.openai.com/settings/organization/billing/credit-grants), а расходы — на [Usage](https://platform.openai.com/usage).
+4. Открой [API keys](https://platform.openai.com/api-keys) и нажми **Create new secret key**.
 5. Скопируй полученный ключ. Он выглядит примерно так:
    ```
-   AIzaSyB-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
    ```
 6. **Сохрани его в надёжном месте.** Повторно его показывать не будут — можно только создать новый.
 
-### Бесплатные лимиты Gemini
+### Биллинг OpenAI API
 
-На момент написания (2026):
-- Gemini 2.5 Flash — бесплатный тариф ~10 запросов/мин и ~250 запросов/день.
-- Если один табель содержит, скажем, 18 строк — это 18 запросов. То есть бесплатно можно обработать ~13 табелей в день.
-- Платный тариф включается автоматически, если привязан биллинг — тогда лимиты в десятки раз выше.
-
-Проверить актуальные лимиты: [https://ai.google.dev/gemini-api/docs/rate-limits](https://ai.google.dev/gemini-api/docs/rate-limits).
+Подписка ChatGPT и баланс API не связаны. Для API нужен отдельный биллинг на `platform.openai.com`. Купленные кредиты списываются по фактическому числу токенов и имеют срок действия. Актуальные цены находятся на [странице моделей OpenAI](https://developers.openai.com/api/docs/models).
 
 ---
 
@@ -75,12 +70,13 @@ cp .env.example .env
 
 ```dotenv
 TELEGRAM_TOKEN=7891234567:AAEhB-xxxxxxxxxxxxxxxxxxxxxxxxxx
-GEMINI_API_KEY=AIzaSyB-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Пока оставить пустым — заполним на шаге 6
 ALLOWED_USER_IDS=
 
-GEMINI_MODEL=gemini-2.5-flash
+OPENAI_MODEL=gpt-5.6-luna
+OPENAI_REASONING_EFFORT=low
 LLM_CONCURRENCY=5
 ```
 
@@ -90,7 +86,7 @@ LLM_CONCURRENCY=5
 
 ## Шаг 5. Проверить, что всё работает (без Telegram)
 
-Можно протестировать всю цепочку парсер → Gemini → исправленный xlsx без запуска бота:
+Можно протестировать всю цепочку парсер → OpenAI → исправленный xlsx без запуска бота:
 
 ```bash
 python -m scripts.check_file "Сайдашев Кирилл Алексеевич.xlsx"
@@ -115,8 +111,9 @@ INFO src.checker: Parsed 18 work entries from Сайдашев Кирилл Ал
 ```
 
 Если вместо этого ругается:
-- `RuntimeError: GEMINI_API_KEY is not set` → проверь, что `.env` лежит в корне проекта и в нём заполнен ключ.
-- `google.api_core.exceptions.PermissionDenied` или 403 → ключ Gemini неверный или не включён API. Зайди заново на [aistudio.google.com/apikey](https://aistudio.google.com/apikey) и создай новый.
+- `RuntimeError: OPENAI_API_KEY is not set` → проверь, что `.env` лежит в корне проекта и в нём заполнен ключ.
+- `AuthenticationError` или 401 → ключ OpenAI неверный или отозван. Создай новый ключ на [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+- `insufficient_quota` → на API-балансе нет средств или не настроен биллинг.
 - `429 Too Many Requests` → превышен лимит запросов. Подожди минуту или уменьши `LLM_CONCURRENCY` в `.env` до 2-3.
 
 Открой получившийся xlsx — должны быть подсвечены жёлтым исправленные ячейки.
@@ -203,14 +200,16 @@ INFO root: Starting bot. Whitelist: [123456789, 987654321]
 
 ---
 
-## Поменять модель Gemini
+## Поменять модель OpenAI
 
-В `.env` поменяй `GEMINI_MODEL`. Варианты:
-- `gemini-2.5-flash` — быстрая, дешёвая, рекомендую по умолчанию.
-- `gemini-2.5-pro` — точнее, но медленнее и платная.
-- `gemini-2.0-flash-001` — более старая, если Flash 2.5 будет недоступна.
+В `.env` поменяй `OPENAI_MODEL`. Варианты:
+- `gpt-5.6-luna` — экономичная модель по умолчанию для больших объёмов.
+- `gpt-5.6-terra` — баланс качества и стоимости.
+- `gpt-5.6-sol` — максимальное качество, выше стоимость.
 
-Список актуальных моделей: [https://ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models).
+Параметр `OPENAI_REASONING_EFFORT` принимает `none`, `low`, `medium`, `high`, `xhigh` или `max`. Для проверки табелей установлен `low`.
+
+Список актуальных моделей: [https://developers.openai.com/api/docs/models](https://developers.openai.com/api/docs/models).
 
 ---
 

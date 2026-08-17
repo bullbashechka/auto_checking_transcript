@@ -1,6 +1,6 @@
 # Auto-checking timesheet bot
 
-Telegram-бот для автоматической проверки табелей учёта рабочего времени 1С-консультанта. Принимает xlsx, проверяет колонку «Содержание» через Gemini 2.5 Flash, возвращает исправленный файл с подсветкой и текстовый отчёт.
+Telegram-бот для автоматической проверки табелей учёта рабочего времени 1С-консультанта. Принимает xlsx, проверяет колонку «Содержание» через OpenAI GPT-5.6 Luna, возвращает исправленный файл с подсветкой и текстовый отчёт.
 
 > 📘 **Первый запуск с нуля** (получение ключей Google и Telegram, заполнение `.env`, тест) — см. [docs/SETUP.md](docs/SETUP.md).
 
@@ -13,7 +13,7 @@ python -m venv .venv
 pip install -r requirements.txt
 
 copy .env.example .env
-# открой .env и заполни TELEGRAM_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS
+# открой .env и заполни TELEGRAM_TOKEN, OPENAI_API_KEY, ALLOWED_USER_IDS
 ```
 
 **macOS / Linux:**
@@ -23,7 +23,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# открой .env и заполни TELEGRAM_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS
+# открой .env и заполни TELEGRAM_TOKEN, OPENAI_API_KEY, ALLOWED_USER_IDS
 ```
 
 > На Windows, если `Activate.ps1` блокируется политикой, выполни один раз:
@@ -64,6 +64,6 @@ python -m scripts.check_file "Сайдашев Кирилл Алексеевич
 - `src/main.py` — точка входа (запускает бот).
 - `src/bot.py` — Telegram-хендлеры.
 - `src/checker.py` — связка парсер + LLM + writer.
-- `src/llm.py` — Gemini-клиент.
+- `src/llm.py` — клиент OpenAI Responses API.
 - `src/xlsx_processor.py` — чтение/запись xlsx.
 - `src/prompts/system_prompt.txt` — системный промт корректора.

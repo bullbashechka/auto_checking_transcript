@@ -63,17 +63,18 @@ systemctl restart auto-checking-transcript
 
 ---
 
-## Поменять модель Gemini
+## Поменять модель OpenAI
 
 ```bash
 nano /opt/auto_checking_transcript/.env
 ```
 
-Изменить строку `GEMINI_MODEL`:
+Изменить строку `OPENAI_MODEL`:
 
 ```dotenv
-GEMINI_MODEL=gemini-2.5-flash      # быстрая, дешёвая (по умолчанию)
-GEMINI_MODEL=gemini-2.5-pro        # точнее, но медленнее и платная
+OPENAI_MODEL=gpt-5.6-luna          # экономичная модель по умолчанию
+OPENAI_MODEL=gpt-5.6-terra         # точнее, но дороже
+OPENAI_REASONING_EFFORT=low        # none/low/medium/high/xhigh/max
 ```
 
 Перезапустить:
@@ -92,7 +93,7 @@ journalctl -u auto-checking-transcript -n 50 --no-pager
 
 Частые причины:
 - `RuntimeError: TELEGRAM_TOKEN is not set` — проверь `.env`
-- `RuntimeError: GEMINI_API_KEY is not set` — проверь `.env`
+- `RuntimeError: OPENAI_API_KEY is not set` — проверь `.env`
 - `ModuleNotFoundError` — запусти `.venv/bin/pip install -r requirements.txt`
 - `409 Conflict` — бот уже запущен где-то ещё (локально или второй раз на сервере)
 

@@ -3,13 +3,13 @@ from __future__ import annotations
 import importlib.util
 import unittest
 
-HAS_GENAI = importlib.util.find_spec("google.genai") is not None
+HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
-if HAS_GENAI:
+if HAS_OPENAI:
     from src import checker
 
 
-@unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
+@unittest.skipUnless(HAS_OPENAI, "openai not installed — run `pip install -r requirements.txt`")
 class TestTextNormalization(unittest.TestCase):
     def test_collapses_two_or_more_plain_spaces(self) -> None:
         cases = {

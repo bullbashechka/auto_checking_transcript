@@ -25,20 +25,21 @@ def _parse_bool(raw: str | None) -> bool:
 @dataclass(frozen=True)
 class Settings:
     telegram_token: str
-    gemini_api_key: str
+    openai_api_key: str
     allowed_user_ids: frozenset[int]
     allow_any: bool
-    gemini_model: str
+    openai_model: str
+    openai_reasoning_effort: str
     llm_concurrency: int
 
 
 def load_settings() -> Settings:
     telegram_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not telegram_token:
         raise RuntimeError("TELEGRAM_TOKEN is not set (see .env.example)")
-    if not gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set (see .env.example)")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set (see .env.example)")
 
     allowed = _parse_ids(os.environ.get("ALLOWED_USER_IDS"))
     allow_any = _parse_bool(os.environ.get("ALLOW_ANY"))
@@ -50,9 +51,10 @@ def load_settings() -> Settings:
 
     return Settings(
         telegram_token=telegram_token,
-        gemini_api_key=gemini_api_key,
+        openai_api_key=openai_api_key,
         allowed_user_ids=allowed,
         allow_any=allow_any,
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        openai_model=os.environ.get("OPENAI_MODEL", "gpt-5.6-luna"),
+        openai_reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "low"),
         llm_concurrency=int(os.environ.get("LLM_CONCURRENCY", "5")),
     )

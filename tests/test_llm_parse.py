@@ -1,4 +1,4 @@
-"""Тесты на парсинг батч-ответа Gemini без обращения к сети.
+"""Тесты на парсинг батч-ответа OpenAI без обращения к сети.
 
 Запуск: `python -m unittest tests.test_llm_parse` из корня проекта.
 """
@@ -8,9 +8,9 @@ import importlib.util
 import unittest
 from unittest.mock import patch
 
-HAS_GENAI = importlib.util.find_spec("google.genai") is not None
+HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
-if HAS_GENAI:
+if HAS_OPENAI:
     from src.config import Settings
     from src.llm import BatchItem, LLMClient
 
@@ -18,10 +18,11 @@ if HAS_GENAI:
 def _stub_settings() -> "Settings":
     return Settings(
         telegram_token="x",
-        gemini_api_key="x",
+        openai_api_key="x",
         allowed_user_ids=frozenset(),
         allow_any=True,
-        gemini_model="gemini-2.5-flash",
+        openai_model="gpt-5.6-luna",
+        openai_reasoning_effort="low",
         llm_concurrency=1,
     )
 
@@ -33,20 +34,17 @@ def _make_items(n: int) -> list["BatchItem"]:
     ]
 
 
-@unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
+@unittest.skipUnless(HAS_OPENAI, "openai not installed — run `pip install -r requirements.txt`")
 class TestParseBatch(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = patch("src.llm.genai.Client")
+        patcher = patch("src.llm.AsyncOpenAI")
         patcher.start()
         self.addCleanup(patcher.stop)
-        cache_patcher = patch.object(LLMClient, "_try_create_cache_sync")
-        cache_patcher.start()
-        self.addCleanup(cache_patcher.stop)
         self.client = LLMClient(_stub_settings())
 
     def test_all_empty(self) -> None:
         items = _make_items(3)
-        raw = '[{"id": 0}, {"id": 1}, {"id": 2}]'
+        raw = '{"results": [{"id": 0}, {"id": 1}, {"id": 2}]}'
         results = self.client._parse_batch(raw, items)
         self.assertIsNotNone(results)
         assert results is not None

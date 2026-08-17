@@ -12,9 +12,9 @@ from unittest.mock import AsyncMock, patch
 
 from openpyxl import Workbook, load_workbook
 
-HAS_GENAI = importlib.util.find_spec("google.genai") is not None
+HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
-if HAS_GENAI:
+if HAS_OPENAI:
     from src import checker
     from src.llm import BATCH_SIZE, CheckResult
     from src.xlsx_processor import HIGHLIGHT_FILL
@@ -43,7 +43,7 @@ def _make_workbook_with_entries(n: int) -> Path:
     return _make_workbook_with_contents([f"Работа {i}" for i in range(n)])
 
 
-@unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
+@unittest.skipUnless(HAS_OPENAI, "openai not installed — run `pip install -r requirements.txt`")
 class TestCheckerBatching(unittest.TestCase):
     def _run(self, coro):
         loop = asyncio.new_event_loop()

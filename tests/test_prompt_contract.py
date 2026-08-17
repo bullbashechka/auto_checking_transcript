@@ -94,6 +94,8 @@ class TestPromptContract(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(field, self.prompt)
 
+        self.assertIn('{"results": [...]}', self.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
