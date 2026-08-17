@@ -88,6 +88,25 @@ class TestParseBatch(unittest.TestCase):
         self.assertIsNone(results[0].corrected)
         self.assertEqual(results[0].changes, [])
 
+    def test_corrected_with_only_equivalent_variants_is_dropped(self) -> None:
+        items = [
+            BatchItem(
+                id=0,
+                contractor="c",
+                date="01.01.2026",
+                time="09:00",
+                content="Учет в с/х",
+            )
+        ]
+        raw = (
+            '[{"id": 0, "Исправленное_Содержание": "Учёт в СХ", '
+            '"Изменения": ["заменено ё и сокращение"]}]'
+        )
+        results = self.client._parse_batch(raw, items)
+        assert results is not None
+        self.assertIsNone(results[0].corrected)
+        self.assertEqual(results[0].changes, [])
+
     def test_invalid_json_returns_none(self) -> None:
         items = _make_items(3)
         self.assertIsNone(self.client._parse_batch("not json", items))

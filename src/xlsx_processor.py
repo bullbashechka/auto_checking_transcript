@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import copy
 from dataclasses import dataclass
 from datetime import date
 from difflib import SequenceMatcher
@@ -10,6 +11,7 @@ from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
 from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 from openpyxl.workbook import Workbook
 
 DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
@@ -158,6 +160,13 @@ def write_result(
     new_col = ws.max_column + 1
     ws.cell(row=header_row, column=new_col).value = "Исправленное содержание"
 
+    if corrections:
+        source_col_letter = get_column_letter(corrections[0].content_col)
+        new_col_letter = get_column_letter(new_col)
+        source_width = ws.column_dimensions[source_col_letter].width
+        if source_width is not None:
+            ws.column_dimensions[new_col_letter].width = source_width
+
     correction_rows = {c.row_idx for c in corrections}
     warning_rows = {w.row_idx for w in warnings}
     combined_rows = correction_rows & warning_rows
@@ -166,6 +175,9 @@ def write_result(
         fill = COMBINED_FILL if corr.row_idx in combined_rows else HIGHLIGHT_FILL
         new_cell = ws.cell(row=corr.row_idx, column=new_col)
         new_cell.value = _build_diff_rich_text(corr.original_content, corr.new_content)
+        alignment = copy(ws.cell(row=corr.row_idx, column=corr.content_col).alignment)
+        alignment.wrap_text = True
+        new_cell.alignment = alignment
         new_cell.fill = fill
         ws.cell(row=corr.row_idx, column=corr.content_col).fill = fill
 

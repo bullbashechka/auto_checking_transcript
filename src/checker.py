@@ -39,10 +39,16 @@ _ADDRESS_WITH_SPACES_RE = re.compile(
 )
 _SPACES_AROUND_DOT_RE = re.compile(r" *\. *")
 _REPEATED_PLAIN_SPACES_RE = re.compile(r" {2,}")
+_WORK_BY_NOTICES_RE = re.compile(r"(?i)(\bработа[ \t]+по[ \t]+)извещениям\b")
+_OBLIGATION_BY_NOTICES_RE = re.compile(
+    r"(?i)(\bобязательство[ \t]+по[ \t]+)извещениям\b"
+)
 
 _ADDRESS_SPACING_CHANGE = "исправлены пробелы внутри адреса сайта или email"
 _REPEATED_SPACES_CHANGE = "двойные пробелы заменены одним"
 _SENTENCE_SPACING_CHANGE = "добавлен пробел после знака препинания"
+_WORK_BY_NOTICES_CHANGE = "уточнён регистр «Извещениям» в формулировке работы"
+_OBLIGATION_BY_NOTICES_CHANGE = "уточнён регистр «извещениям» в названии документа"
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
@@ -118,6 +124,29 @@ def _normalize_mechanical_spacing(text: str) -> tuple[str, list[str]]:
     return sentence_text, changes
 
 
+def _normalize_contextual_notices_case(text: str) -> tuple[str, list[str]]:
+    """Нормализует регистр «извещениям» в двух согласованных формулировках."""
+    changes: list[str] = []
+
+    work_text, work_count = _WORK_BY_NOTICES_RE.subn(r"\1Извещениям", text)
+    if work_count:
+        changes.append(_WORK_BY_NOTICES_CHANGE)
+
+    obligation_text, obligation_count = _OBLIGATION_BY_NOTICES_RE.subn(
+        r"\1извещениям", work_text
+    )
+    if obligation_count:
+        changes.append(_OBLIGATION_BY_NOTICES_CHANGE)
+
+    return obligation_text, changes
+
+
+def _normalize_input_text(text: str) -> tuple[str, list[str]]:
+    spaced_text, spacing_changes = _normalize_mechanical_spacing(text)
+    contextual_text, contextual_changes = _normalize_contextual_notices_case(spaced_text)
+    return contextual_text, _merge_unique_changes(spacing_changes, contextual_changes)
+
+
 def _normalize_surname_initials(text: str) -> tuple[str, bool]:
     """Убирает лишний пробел между инициалами после фамилии: Иванов И. И. -> Иванов И.И."""
     fixed = _SURNAME_INITIALS_SPACING_RE.sub(r"\1 \2.\3.", text)
@@ -179,7 +208,7 @@ async def process_file(
     total = len(entries)
     log.info("Parsed %d work entries from '%s'", total, input_path.name)
     normalized_inputs = {
-        entry.row_idx: _normalize_mechanical_spacing(entry.content)
+        entry.row_idx: _normalize_input_text(entry.content)
         for entry in entries
     }
 
@@ -247,9 +276,12 @@ async def process_file(
         pre_normalized_text, pre_changes = normalized_inputs[entry.row_idx]
         base_text = result.corrected if result.corrected else pre_normalized_text
         spaced_text, post_changes = _normalize_mechanical_spacing(base_text)
-        initials_text, initials_normalized = _normalize_surname_initials(spaced_text)
+        contextual_text, post_contextual_changes = _normalize_contextual_notices_case(spaced_text)
+        initials_text, initials_normalized = _normalize_surname_initials(contextual_text)
         final_text, dot_added = _ensure_trailing_dot(initials_text)
-        changes = _merge_unique_changes(pre_changes, list(result.changes), post_changes)
+        changes = _merge_unique_changes(
+            pre_changes, list(result.changes), post_changes, post_contextual_changes
+        )
         if initials_normalized:
             changes = _merge_unique_changes(
                 changes, ["убран лишний пробел между инициалами"]

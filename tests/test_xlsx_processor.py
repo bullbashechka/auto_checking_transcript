@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.styles import Alignment
 
 from src.xlsx_processor import (
     COMBINED_FILL,
@@ -168,6 +169,35 @@ class TestWriteResult(unittest.TestCase):
             red_text = "".join(b.text for b in red_blocks)
             self.assertIn("обновление", red_text, "слово целиком должно быть красным при пословном diff")
             self.assertIn("ИБ", red_text)
+
+    def test_corrected_cell_wraps_text_and_keeps_source_alignment(self) -> None:
+        wb = _make_minimal_workbook()
+        ws = wb.active
+        ws.column_dimensions["B"].width = 42
+        ws["B2"].alignment = Alignment(horizontal="right", vertical="top", indent=1)
+        corrections = [
+            Correction(row_idx=2, content_col=2, original_content="original", new_content="fixed")
+        ]
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "input.xlsx"
+            wb.save(tmp)
+            out = write_result(wb, corrections, [], tmp, header_row=1, output_dir=Path(tmpdir))
+
+            from openpyxl import load_workbook
+
+            written = load_workbook(out)
+            written_ws = written.active
+            corrected = written_ws.cell(row=2, column=3)
+            original = written_ws.cell(row=2, column=2)
+            self.assertTrue(corrected.alignment.wrap_text)
+            self.assertEqual(corrected.alignment.horizontal, "right")
+            self.assertEqual(corrected.alignment.vertical, "top")
+            self.assertEqual(corrected.alignment.indent, 1)
+            self.assertIsNone(original.alignment.wrap_text)
+            self.assertEqual(written_ws.column_dimensions["C"].width, 42)
 
 
 def _make_minimal_workbook() -> Workbook:

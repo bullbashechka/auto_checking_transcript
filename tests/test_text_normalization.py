@@ -22,6 +22,24 @@ class TestTextNormalization(unittest.TestCase):
                 fixed, _changes = checker._normalize_mechanical_spacing(source)
                 self.assertEqual(fixed, expected)
 
+    def test_normalizes_contextual_notices_case(self) -> None:
+        cases = {
+            "Работа по извещениям": (
+                "Работа по Извещениям",
+                "уточнён регистр «Извещениям» в формулировке работы",
+            ),
+            "Обязательство по Извещениям": (
+                "Обязательство по извещениям",
+                "уточнён регистр «извещениям» в названии документа",
+            ),
+            "Проверка документа Извещение": ("Проверка документа Извещение", None),
+        }
+        for source, (expected, change) in cases.items():
+            with self.subTest(source=source):
+                fixed, changes = checker._normalize_contextual_notices_case(source)
+                self.assertEqual(fixed, expected)
+                self.assertEqual(changes, [] if change is None else [change])
+
     def test_preserves_tabs_and_newlines(self) -> None:
         source = "один\t\tдва\n\nтри"
         fixed, changes = checker._normalize_mechanical_spacing(source)

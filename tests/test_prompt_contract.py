@@ -74,7 +74,7 @@ class TestPromptContract(unittest.TestCase):
             "ИСНА", "КНП", "ГЗ", "БК", "УНФ", "УТ", "КА", "СЛК", "ИБ",
             "ТМЗ", "ООСМС", "ОСМС", "ВОСМС", "ОПВ", "ОПВР", "СО", "ИПН",
             "КПН", "НКТ", "НДС", "ФНО", "ОСВ", "НУ", "БУ", "ПР", "ВР",
-            "ФА", "ЛС", "НП", "МРП", "СХ", "ГЕМ", "ВС", "ПК", "ТОО",
+            "ФА", "ЛС", "НП", "МРП", "СХ", "с/х", "ГЕМ", "ВС", "ПК", "ТОО",
             "ИП", "СБ", "с/б", "ЗП", "з/п", "БЛ", "б/л", "ИИН", "ИНН",
             "БИН",
         ):
@@ -83,6 +83,16 @@ class TestPromptContract(unittest.TestCase):
 
         self.assertIn("не добавляй к ним падежные окончания", self.prompt)
         self.assertIn("исправляй склонённую форму на исходное сокращение", self.prompt)
+
+    def test_contains_equivalent_spelling_and_contextual_case_rules(self) -> None:
+        for fragment in (
+            "«е» и «ё», а также «Е» и «Ё», равнозначны",
+            "«СХ» и «с/х» равнозначны",
+            "«Работа по Извещениям»",
+            "«Обязательство по извещениям»",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.prompt)
 
     def test_keeps_json_contract(self) -> None:
         for field in (

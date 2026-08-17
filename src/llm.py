@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,12 +55,26 @@ _RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
+_EQUIVALENT_ABBREVIATION_RE = re.compile(r"(?<![\w/])(?:СХ|с/х)(?![\w/])")
+
 
 def _is_non_retryable_api_error(err: Exception) -> bool:
     return (
         isinstance(err, APIStatusError)
         and 400 <= err.status_code < 500
         and err.status_code != 429
+    )
+
+
+def _canonicalize_equivalent_variants(text: str) -> str:
+    """Сводит допустимые варианты е/ё и СХ/с/х для сравнения ответов LLM."""
+    with_plain_e = text.replace("Ё", "Е").replace("ё", "е")
+    return _EQUIVALENT_ABBREVIATION_RE.sub("СХ", with_plain_e)
+
+
+def _has_only_equivalent_differences(original: str, corrected: str) -> bool:
+    return _canonicalize_equivalent_variants(original) == _canonicalize_equivalent_variants(
+        corrected
     )
 
 
@@ -243,9 +258,11 @@ class LLMClient:
                 log.warning("Batch element validation failed for id=%d: %s", it.id, err)
                 return None
 
-            if result.corrected == it.content:
+            if result.corrected is not None and _has_only_equivalent_differences(
+                it.content, result.corrected
+            ):
                 log.debug(
-                    "LLM returned identical 'corrected' text for id=%d — dropping changes (%d items)",
+                    "LLM returned only equivalent variants for id=%d — dropping changes (%d items)",
                     it.id,
                     len(result.changes),
                 )

@@ -147,6 +147,36 @@ class TestCheckerBatching(unittest.TestCase):
             HIGHLIGHT_FILL.start_color.rgb,
         )
 
+    def test_normalizes_contextual_notices_before_llm_and_in_report(self) -> None:
+        path = _make_workbook_with_contents(
+            ["Работа  по извещениям", "Обязательство по Извещениям"]
+        )
+
+        async def side_effect(items):
+            self.assertEqual(
+                [item.content for item in items],
+                ["Работа по Извещениям", "Обязательство по извещениям"],
+            )
+            return [CheckResult() for _ in items]
+
+        mock_llm = AsyncMock()
+        mock_llm.check_batch.side_effect = side_effect
+        output_path, report = self._run(checker.process_file(path, mock_llm))
+
+        self.assertEqual(len(report.corrections), 2)
+        work_changes = report.corrections[0][1]
+        obligation_changes = report.corrections[1][1]
+        self.assertIn("двойные пробелы заменены одним", work_changes)
+        self.assertIn("уточнён регистр «Извещениям» в формулировке работы", work_changes)
+        self.assertIn(
+            "уточнён регистр «извещениям» в названии документа", obligation_changes
+        )
+        written_wb = load_workbook(output_path)
+        self.assertEqual(written_wb.active["E4"].value, "Работа по Извещениям.")
+        self.assertEqual(
+            written_wb.active["E6"].value, "Обязательство по извещениям."
+        )
+
     def test_normalizes_llm_output_and_merges_changes_without_duplicates(self) -> None:
         path = _make_workbook_with_contents(["Проверка openai. com"])
 
