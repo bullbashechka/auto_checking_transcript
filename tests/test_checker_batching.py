@@ -94,23 +94,22 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(fixed, "Настройка пользователя Иванов И.И.")
 
-    def test_batch_size_is_three(self) -> None:
-        self.assertEqual(BATCH_SIZE, 3, "размер батча зафиксирован = 3")
+    def test_batch_size_is_fifteen(self) -> None:
+        self.assertEqual(BATCH_SIZE, 15, "размер батча зафиксирован = 15")
 
-    def test_chunks_into_batches_of_3(self) -> None:
-        path = _make_workbook_with_entries(10)
+    def test_chunks_into_batches_of_15(self) -> None:
+        path = _make_workbook_with_entries(32)
         mock_llm = AsyncMock()
-        mock_llm.check_batch.return_value = [CheckResult() for _ in range(3)]
 
         async def side_effect(items):
             return [CheckResult() for _ in items]
 
         mock_llm.check_batch.side_effect = side_effect
         self._run(checker.process_file(path, mock_llm))
-        # 10 entries / 3 = 4 батча (3+3+3+1)
-        self.assertEqual(mock_llm.check_batch.await_count, 4)
+        # 32 entries / 15 = 3 батча (15+15+2)
         batch_sizes = [len(call.args[0]) for call in mock_llm.check_batch.await_args_list]
-        self.assertEqual(sorted(batch_sizes, reverse=True), [3, 3, 3, 1])
+        self.assertEqual(mock_llm.check_batch.await_count, 3)
+        self.assertEqual(sorted(batch_sizes, reverse=True), [15, 15, 2])
 
     def test_run_preserves_current_event_loop(self) -> None:
         with warnings.catch_warnings():
@@ -258,7 +257,7 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertEqual(contents, [f"Работа {i}" for i in range(7)])
 
     def test_progress_log_uses_batch_units(self) -> None:
-        path = _make_workbook_with_entries(6)
+        path = _make_workbook_with_entries(16)
 
         async def side_effect(items):
             return [CheckResult() for _ in items]
@@ -273,7 +272,7 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertTrue(progress_lines, "должна быть хотя бы одна строка прогресса по батчам")
         last = progress_lines[-1]
         self.assertIn("2/2 batches", last)
-        self.assertIn("6 / 6 entries", last)
+        self.assertIn("16 / 16 entries", last)
 
     def test_exception_in_check_batch_marks_errors_for_whole_batch(self) -> None:
         path = _make_workbook_with_entries(4)
@@ -286,8 +285,8 @@ class TestCheckerBatching(unittest.TestCase):
         mock_llm = AsyncMock()
         mock_llm.check_batch.side_effect = side_effect
         _, report = self._run(checker.process_file(path, mock_llm))
-        # первый батч (3 шт.) упал — все три уходят в errors
-        self.assertEqual(report.errors, 3)
+        # единственный батч (4 шт.) упал — все четыре уходят в errors
+        self.assertEqual(report.errors, 4)
 
 
 if __name__ == "__main__":

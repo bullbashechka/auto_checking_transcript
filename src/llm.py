@@ -5,18 +5,34 @@ from collections import Counter
 from difflib import SequenceMatcher
 import json
 import logging
+import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from openai import APIStatusError, AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+)
 from pydantic import BaseModel, Field, ValidationError
 
 from .config import PROMPTS_DIR, Settings
 
 log = logging.getLogger(__name__)
 
-BATCH_SIZE = 3
+BATCH_SIZE = 15
+_MAX_ATTEMPTS = 4
+_MIN_OUTPUT_TOKENS = 1024
+_MAX_OUTPUT_TOKENS = 4096
+_OUTPUT_TOKENS_PER_ITEM = 256
+_FALLBACK_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+_RETRY_DELAY_HEADER_RE = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>ms|s|m)?\s*$",
+    re.IGNORECASE,
+)
 
 _RESPONSE_FORMAT: dict[str, Any] = {
     "type": "json_schema",
@@ -76,8 +92,69 @@ def _is_non_retryable_api_error(err: Exception) -> bool:
     return (
         isinstance(err, APIStatusError)
         and 400 <= err.status_code < 500
-        and err.status_code != 429
+        and err.status_code not in {408, 409, 429}
     )
+
+
+def _is_retryable_api_error(err: Exception) -> bool:
+    if isinstance(err, APIStatusError):
+        return err.status_code in {408, 409, 429} or err.status_code >= 500
+    return isinstance(err, (APIConnectionError, APITimeoutError, TimeoutError))
+
+
+def _parse_retry_delay(value: object) -> float | None:
+    if value is None:
+        return None
+    match = _RETRY_DELAY_HEADER_RE.match(str(value))
+    if not match:
+        return None
+    delay = float(match.group("value"))
+    unit = (match.group("unit") or "s").lower()
+    if unit == "ms":
+        delay /= 1000
+    elif unit == "m":
+        delay *= 60
+    return max(0.0, delay)
+
+
+def _retry_delay_from_error(err: Exception, fallback: float) -> float:
+    response = getattr(err, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        for header_name in (
+            "retry-after-ms",
+            "retry-after",
+            "x-ratelimit-reset-tokens",
+        ):
+            delay = _parse_retry_delay(headers.get(header_name))
+            if delay is not None:
+                return delay + random.uniform(0.05, 0.25)
+    return fallback + random.uniform(0.05, 0.25)
+
+
+class InvalidLLMResponseError(RuntimeError):
+    """Raised when a single item cannot be parsed after batch splitting."""
+
+
+class TokenPacer:
+    """Smooths token reservations at a configured tokens-per-minute rate."""
+
+    def __init__(self, tokens_per_minute: int) -> None:
+        self._rate_per_second = max(1.0, tokens_per_minute / 60.0)
+        self._next_slot = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int) -> float:
+        reservation = max(1, int(tokens))
+        async with self._lock:
+            now = time.monotonic()
+            scheduled = max(now, self._next_slot)
+            self._next_slot = scheduled + reservation / self._rate_per_second
+
+        delay = max(0.0, scheduled - now)
+        if delay:
+            await asyncio.sleep(delay)
+        return delay
 
 
 def _canonicalize_equivalent_variants(text: str) -> str:
@@ -247,6 +324,7 @@ class LLMClient:
     _client: AsyncOpenAI = None  # type: ignore[assignment]
     _system_prompt: str = ""
     _semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
+    _token_pacer: TokenPacer = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         self._client = AsyncOpenAI(
@@ -255,13 +333,24 @@ class LLMClient:
         )
         self._system_prompt = _load_system_prompt()
         self._semaphore = asyncio.Semaphore(self.settings.llm_concurrency)
+        effective_tpm = int(
+            self.settings.openai_tpm_limit * self.settings.openai_tpm_utilization
+        )
+        if effective_tpm <= 0:
+            raise ValueError("OPENAI_TPM_LIMIT × OPENAI_TPM_UTILIZATION must be positive")
+        self._token_pacer = TokenPacer(effective_tpm)
 
     async def check(self, contractor: str, date: str, time: str, content: str) -> CheckResult:
         item = BatchItem(id=0, contractor=contractor, date=date, time=time, content=content)
         results = await self.check_batch([item])
-        return results[0]
+        result = results[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
-    async def check_batch(self, items: list[BatchItem]) -> list[CheckResult]:
+    async def check_batch(
+        self, items: list[BatchItem]
+    ) -> list[CheckResult | BaseException]:
         if not items:
             return []
 
@@ -277,50 +366,114 @@ class LLMClient:
         ]
         user_message = json.dumps(payload, ensure_ascii=False)
 
-        raw: str | None = None
-        async with self._semaphore:
-            try:
-                raw = await self._call_with_retries(user_message)
-            except Exception as err:  # noqa: BLE001
-                if _is_non_retryable_api_error(err):
-                    raise
-                log.warning("Batch call failed entirely (size=%d): %s", len(items), err)
+        raw = await self._call_with_retries(user_message)
+        parsed = self._parse_batch(raw, items)
+        if parsed is not None:
+            return parsed
 
-        if raw is not None:
-            parsed = self._parse_batch(raw, items)
-            if parsed is not None:
-                return parsed
-            log.warning("Batch response invalid (size=%d) — falling back to singles", len(items))
-
-        # При размере 1 возвращаем пустой результат, чтобы не входить в рекурсию.
         if len(items) == 1:
-            return [CheckResult()]
-
-        results: list[CheckResult] = []
-        for it in items:
-            single = BatchItem(
-                id=0,
-                contractor=it.contractor,
-                date=it.date,
-                time=it.time,
-                content=it.content,
+            raise InvalidLLMResponseError(
+                f"LLM returned an invalid response for item id={items[0].id}"
             )
-            try:
-                sub = await self.check_batch([single])
-                results.append(sub[0])
-            except Exception:  # noqa: BLE001
-                log.exception("Single fallback failed for original id=%d", it.id)
-                results.append(CheckResult())
-        return results
+
+        midpoint = len(items) // 2
+        left_items = items[:midpoint]
+        right_items = items[midpoint:]
+        left_result, right_result = await asyncio.gather(
+            self.check_batch(left_items),
+            self.check_batch(right_items),
+            return_exceptions=True,
+        )
+        return self._coerce_split_result(left_result, left_items) + self._coerce_split_result(
+            right_result, right_items
+        )
+
+    @staticmethod
+    def _coerce_split_result(
+        result: list[CheckResult | BaseException] | BaseException,
+        items: list[BatchItem],
+    ) -> list[CheckResult | BaseException]:
+        if isinstance(result, BaseException):
+            return [result for _ in items]
+        if len(result) != len(items):
+            mismatch = InvalidLLMResponseError(
+                f"Split response length mismatch: expected {len(items)}, got {len(result)}"
+            )
+            return [mismatch for _ in items]
+        return result
 
     async def _call_with_retries(self, user_message: str) -> str:
-        delays = [0, 2, 4]
+        input_tokens = await self._count_input_tokens(user_message)
+        item_count = self._item_count(user_message)
+        max_output_tokens = min(
+            _MAX_OUTPUT_TOKENS,
+            max(_MIN_OUTPUT_TOKENS, _OUTPUT_TOKENS_PER_ITEM * item_count),
+        )
+        reserved_tokens = input_tokens + max_output_tokens
         last_err: Exception | None = None
-        for attempt, delay in enumerate(delays):
-            if delay:
-                await asyncio.sleep(delay)
+        for attempt in range(_MAX_ATTEMPTS):
+            waited = await self._token_pacer.acquire(reserved_tokens)
+            if waited:
+                log.debug(
+                    "Token limiter delayed batch(size=%d) by %.2fs (reserved=%d)",
+                    item_count,
+                    waited,
+                    reserved_tokens,
+                )
             try:
-                response = await self._client.responses.create(
+                async with self._semaphore:
+                    response = await self._client.responses.create(
+                        model=self.settings.openai_model,
+                        instructions=self._system_prompt,
+                        input=user_message,
+                        reasoning={"effort": self.settings.openai_reasoning_effort},
+                        max_output_tokens=max_output_tokens,
+                        text={
+                            "format": _RESPONSE_FORMAT,
+                            "verbosity": "low",
+                        },
+                        store=False,
+                    )
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    log.debug(
+                        "OpenAI usage batch(size=%d): input=%s output=%s total=%s",
+                        item_count,
+                        getattr(usage, "input_tokens", "?"),
+                        getattr(usage, "output_tokens", "?"),
+                        getattr(usage, "total_tokens", "?"),
+                    )
+                return response.output_text or '{"results": []}'
+            except Exception as err:  # noqa: BLE001
+                last_err = err
+                if _is_non_retryable_api_error(err):
+                    log.error("OpenAI request rejected without retry: %s", err)
+                    raise
+                if not _is_retryable_api_error(err) or attempt == _MAX_ATTEMPTS - 1:
+                    log.warning(
+                        "OpenAI call failed permanently after attempt %d: %s",
+                        attempt + 1,
+                        err,
+                    )
+                    raise
+                fallback = _FALLBACK_BACKOFF_SECONDS[
+                    min(attempt, len(_FALLBACK_BACKOFF_SECONDS) - 1)
+                ]
+                delay = _retry_delay_from_error(err, fallback)
+                log.warning(
+                    "OpenAI call failed (attempt %d/%d), retrying in %.2fs: %s",
+                    attempt + 1,
+                    _MAX_ATTEMPTS,
+                    delay,
+                    err,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+
+    async def _count_input_tokens(self, user_message: str) -> int:
+        try:
+            async with self._semaphore:
+                counted = await self._client.beta.responses.input_tokens.count(
                     model=self.settings.openai_model,
                     instructions=self._system_prompt,
                     input=user_message,
@@ -329,21 +482,46 @@ class LLMClient:
                         "format": _RESPONSE_FORMAT,
                         "verbosity": "low",
                     },
-                    store=False,
                 )
-                return response.output_text or '{"results": []}'
-            except Exception as err:  # noqa: BLE001
-                last_err = err
-                if _is_non_retryable_api_error(err):
-                    log.error("OpenAI request rejected without retry: %s", err)
-                    raise
-                log.warning("OpenAI call failed (attempt %d): %s", attempt + 1, err)
-        raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+            return max(1, int(counted.input_tokens))
+        except Exception as err:  # noqa: BLE001
+            if _is_non_retryable_api_error(err):
+                raise
+            estimated = self._estimate_input_tokens(user_message)
+            log.warning(
+                "Input token preflight failed; using conservative estimate=%d: %s",
+                estimated,
+                err,
+            )
+            return estimated
+
+    def _estimate_input_tokens(self, user_message: str) -> int:
+        serialized_schema = json.dumps(_RESPONSE_FORMAT, ensure_ascii=False)
+        # UTF-8 bytes are an upper bound for byte-pair tokenization. This path is
+        # only used when the official preflight endpoint is temporarily unavailable.
+        return max(
+            1,
+            len(
+                (
+                    self._system_prompt
+                    + user_message
+                    + serialized_schema
+                ).encode("utf-8")
+            ),
+        )
+
+    @staticmethod
+    def _item_count(user_message: str) -> int:
+        try:
+            payload = json.loads(user_message)
+        except json.JSONDecodeError:
+            return 1
+        return max(1, len(payload) if isinstance(payload, list) else 1)
 
     def _parse_batch(
         self, raw: str, items: list[BatchItem]
     ) -> list[CheckResult] | None:
-        """Parse batch response. Returns None on any structural issue (→ caller does fallback)."""
+        """Parse batch response. Returns None on structural issues for recursive splitting."""
         text = raw.strip()
         try:
             data = json.loads(text) if text else {}

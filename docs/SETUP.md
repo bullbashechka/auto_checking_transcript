@@ -77,7 +77,9 @@ ALLOWED_USER_IDS=
 
 OPENAI_MODEL=gpt-5.6-luna
 OPENAI_REASONING_EFFORT=low
-LLM_CONCURRENCY=5
+LLM_CONCURRENCY=3
+OPENAI_TPM_LIMIT=200000
+OPENAI_TPM_UTILIZATION=0.80
 ```
 
 > ⚠️ `.env` уже добавлен в `.gitignore` — он не попадёт в git. Но всё равно не пересылай его никому.
@@ -114,7 +116,7 @@ INFO src.checker: Parsed 18 work entries from Сайдашев Кирилл Ал
 - `RuntimeError: OPENAI_API_KEY is not set` → проверь, что `.env` лежит в корне проекта и в нём заполнен ключ.
 - `AuthenticationError` или 401 → ключ OpenAI неверный или отозван. Создай новый ключ на [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
 - `insufficient_quota` → на API-балансе нет средств или не настроен биллинг.
-- `429 Too Many Requests` → превышен лимит запросов. Подожди минуту или уменьши `LLM_CONCURRENCY` в `.env` до 2-3.
+- `429 Too Many Requests` → превышен организационный лимит запросов или токенов. Лимитер бота учитывает `OPENAI_TPM_LIMIT` и оставляет запас через `OPENAI_TPM_UTILIZATION`; проверь также общий Usage/Rate limits организации.
 
 Открой получившийся xlsx — должны быть подсвечены жёлтым исправленные ячейки.
 

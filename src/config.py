@@ -31,6 +31,8 @@ class Settings:
     openai_model: str
     openai_reasoning_effort: str
     llm_concurrency: int
+    openai_tpm_limit: int = 200_000
+    openai_tpm_utilization: float = 0.80
 
 
 def load_settings() -> Settings:
@@ -49,6 +51,13 @@ def load_settings() -> Settings:
             "or set ALLOW_ANY=true for local debugging (open access)."
         )
 
+    tpm_limit = int(os.environ.get("OPENAI_TPM_LIMIT", "200000"))
+    tpm_utilization = float(os.environ.get("OPENAI_TPM_UTILIZATION", "0.80"))
+    if tpm_limit <= 0:
+        raise RuntimeError("OPENAI_TPM_LIMIT must be positive")
+    if not 0 < tpm_utilization <= 1:
+        raise RuntimeError("OPENAI_TPM_UTILIZATION must be between 0 and 1")
+
     return Settings(
         telegram_token=telegram_token,
         openai_api_key=openai_api_key,
@@ -56,5 +65,7 @@ def load_settings() -> Settings:
         allow_any=allow_any,
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-5.6-luna"),
         openai_reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "low"),
-        llm_concurrency=int(os.environ.get("LLM_CONCURRENCY", "5")),
+        llm_concurrency=int(os.environ.get("LLM_CONCURRENCY", "3")),
+        openai_tpm_limit=tpm_limit,
+        openai_tpm_utilization=tpm_utilization,
     )

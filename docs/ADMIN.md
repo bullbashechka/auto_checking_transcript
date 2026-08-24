@@ -75,6 +75,9 @@ nano /opt/auto_checking_transcript/.env
 OPENAI_MODEL=gpt-5.6-luna          # экономичная модель по умолчанию
 OPENAI_MODEL=gpt-5.6-terra         # точнее, но дороже
 OPENAI_REASONING_EFFORT=low        # none/low/medium/high/xhigh/max
+LLM_CONCURRENCY=3
+OPENAI_TPM_LIMIT=200000
+OPENAI_TPM_UTILIZATION=0.80
 ```
 
 Перезапустить:

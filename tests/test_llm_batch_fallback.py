@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import unittest
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,10 +12,10 @@ HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
 if HAS_OPENAI:
     import httpx
-    from openai import BadRequestError
+    from openai import BadRequestError, RateLimitError
 
     from src.config import Settings
-    from src.llm import BatchItem, LLMClient
+    from src.llm import BatchItem, InvalidLLMResponseError, LLMClient
 
 
 def _stub_settings() -> "Settings":
@@ -57,49 +58,42 @@ class TestCheckBatchFallback(unittest.TestCase):
             self.assertTrue(r.is_empty)
         self.assertEqual(mock.await_count, 1)
 
-    def test_falls_back_on_invalid_response(self) -> None:
+    def test_splits_only_invalid_responses(self) -> None:
         items = _make_items(3)
-        # batch вернул мусор → fallback на 3 single-вызова, каждый ок
-        responses = iter([
-            "garbage",
-            '[{"id":0,"Исправленное_Содержание":"a"}]',
-            '[{"id":0,"Предупреждение":"w"}]',
-            '[{"id":0}]',
-        ])
-        mock = AsyncMock(side_effect=lambda *a, **kw: next(responses))
-        with patch.object(self.client, "_call_with_retries", mock):
-            results = self._run(self.client.check_batch(items))
-        self.assertEqual(mock.await_count, 4)  # 1 batch + 3 singles
-        self.assertEqual(results[0].corrected, "a")
-        self.assertEqual(results[1].warning, "w")
-        self.assertTrue(results[2].is_empty)
 
-    def test_falls_back_on_exception(self) -> None:
-        items = _make_items(2)
-        responses = iter([
-            '[{"id":0,"Исправленное_Содержание":"a"}]',
-            '[{"id":0}]',
-        ])
-
-        def side_effect(*args, **kwargs):
-            if mock.await_count == 1:
-                raise RuntimeError("boom")
-            return next(responses)
+        async def side_effect(user_message):
+            ids = [item["id"] for item in json.loads(user_message)]
+            if ids == [0, 1, 2] or ids == [1, 2]:
+                return "garbage"
+            if ids == [0]:
+                return '[{"id":0,"Исправленное_Содержание":"a"}]'
+            if ids == [1]:
+                return '[{"id":1,"Предупреждение":"w"}]'
+            return '[{"id":2}]'
 
         mock = AsyncMock(side_effect=side_effect)
         with patch.object(self.client, "_call_with_retries", mock):
             results = self._run(self.client.check_batch(items))
-        self.assertEqual(mock.await_count, 3)  # 1 batch (raised) + 2 singles
+        self.assertEqual(mock.await_count, 5)  # full + left + right + 2 singles
         self.assertEqual(results[0].corrected, "a")
-        self.assertTrue(results[1].is_empty)
+        self.assertEqual(results[1].warning, "w")
+        self.assertTrue(results[2].is_empty)
 
-    def test_single_fallback_empty_on_invalid_no_infinite_recursion(self) -> None:
+    def test_api_exception_is_not_split_or_swallowed(self) -> None:
+        items = _make_items(2)
+        mock = AsyncMock(side_effect=RuntimeError("boom"))
+        with patch.object(self.client, "_call_with_retries", mock):
+            with self.assertRaises(RuntimeError):
+                self._run(self.client.check_batch(items))
+        self.assertEqual(mock.await_count, 1)
+
+    def test_single_invalid_response_is_reported_as_error(self) -> None:
         items = _make_items(1)
         mock = AsyncMock(return_value="garbage")
         with patch.object(self.client, "_call_with_retries", mock):
-            results = self._run(self.client.check_batch(items))
-        self.assertEqual(mock.await_count, 1)  # без рекурсии
-        self.assertTrue(results[0].is_empty)
+            with self.assertRaises(InvalidLLMResponseError):
+                self._run(self.client.check_batch(items))
+        self.assertEqual(mock.await_count, 1)
 
     def test_empty_items_no_calls(self) -> None:
         mock = AsyncMock()
@@ -111,6 +105,9 @@ class TestCheckBatchFallback(unittest.TestCase):
     def test_openai_request_uses_luna_and_strict_json(self) -> None:
         create = AsyncMock(return_value=SimpleNamespace(output_text='{"results": []}'))
         self.client._client.responses.create = create
+        self.client._client.beta.responses.input_tokens.count = AsyncMock(
+            return_value=SimpleNamespace(input_tokens=10)
+        )
 
         raw = self._run(self.client._call_with_retries("[]"))
 
@@ -118,6 +115,7 @@ class TestCheckBatchFallback(unittest.TestCase):
         kwargs = create.await_args.kwargs
         self.assertEqual(kwargs["model"], "gpt-5.6-luna")
         self.assertEqual(kwargs["reasoning"], {"effort": "low"})
+        self.assertEqual(kwargs["max_output_tokens"], 1024)
         self.assertFalse(kwargs["store"])
         self.assertEqual(kwargs["text"]["format"]["type"], "json_schema")
         self.assertTrue(kwargs["text"]["format"]["strict"])
@@ -146,6 +144,27 @@ class TestCheckBatchFallback(unittest.TestCase):
                 self._run(self.client.check_batch(_make_items(3)))
 
         self.assertEqual(mock.await_count, 1)
+
+    def test_rate_limit_retries_with_server_delay(self) -> None:
+        response = httpx.Response(
+            429,
+            headers={"retry-after": "0"},
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        )
+        error = RateLimitError("rate limited", response=response, body={})
+        create = AsyncMock(
+            side_effect=[error, SimpleNamespace(output_text='{"results": []}')]
+        )
+        self.client._client.responses.create = create
+        self.client._client.beta.responses.input_tokens.count = AsyncMock(
+            return_value=SimpleNamespace(input_tokens=10)
+        )
+
+        with patch("src.llm.asyncio.sleep", new=AsyncMock()):
+            raw = self._run(self.client._call_with_retries("[]"))
+
+        self.assertEqual(raw, '{"results": []}')
+        self.assertEqual(create.await_count, 2)
 
 
 if __name__ == "__main__":
