@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.worktrees/
 .idea/
 .vscode/
 *.xlsx

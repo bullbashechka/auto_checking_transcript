@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
+import re
 from dataclasses import dataclass
+from typing import Any
 
-from google import genai
-from google.genai import types
+from openai import APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 from .config import PROMPTS_DIR, Settings
@@ -15,8 +15,67 @@ from .config import PROMPTS_DIR, Settings
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 3
-CACHE_TTL_SECONDS = 1800  # 30 минут — TTL explicit context cache в Gemini
-CACHE_TTL_MARGIN_SECONDS = 60  # перезаливаем за минуту до истечения
+
+_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "timesheet_checks",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "Исправленное_Содержание": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}]
+                        },
+                        "Изменения": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "Предупреждение": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}]
+                        },
+                    },
+                    "required": [
+                        "id",
+                        "Исправленное_Содержание",
+                        "Изменения",
+                        "Предупреждение",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    },
+}
+
+_EQUIVALENT_ABBREVIATION_RE = re.compile(r"(?<![\w/])(?:СХ|с/х)(?![\w/])")
+
+
+def _is_non_retryable_api_error(err: Exception) -> bool:
+    return (
+        isinstance(err, APIStatusError)
+        and 400 <= err.status_code < 500
+        and err.status_code != 429
+    )
+
+
+def _canonicalize_equivalent_variants(text: str) -> str:
+    """Сводит допустимые варианты е/ё и СХ/с/х для сравнения ответов LLM."""
+    with_plain_e = text.replace("Ё", "Е").replace("ё", "е")
+    return _EQUIVALENT_ABBREVIATION_RE.sub("СХ", with_plain_e)
+
+
+def _has_only_equivalent_differences(original: str, corrected: str) -> bool:
+    return _canonicalize_equivalent_variants(original) == _canonicalize_equivalent_variants(
+        corrected
+    )
 
 
 @dataclass(frozen=True)
@@ -47,91 +106,17 @@ def _load_system_prompt() -> str:
 @dataclass
 class LLMClient:
     settings: Settings
-    _client: genai.Client = None  # type: ignore[assignment]
+    _client: AsyncOpenAI = None  # type: ignore[assignment]
     _system_prompt: str = ""
     _semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
-    _cache_name: str | None = None
-    _cache_expires_at: float = 0.0
-    _cache_lock: asyncio.Lock = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        self._client = genai.Client(api_key=self.settings.gemini_api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.settings.openai_api_key,
+            max_retries=0,
+        )
         self._system_prompt = _load_system_prompt()
         self._semaphore = asyncio.Semaphore(self.settings.llm_concurrency)
-        self._cache_lock = asyncio.Lock()
-        self._try_create_cache_sync()
-
-    def _try_create_cache_sync(self) -> None:
-        """Создаём explicit context cache синхронно при старте.
-
-        Если не получилось (например, system_prompt короче минимума токенов для
-        кэша на этой модели) — продолжаем работу без кэша: каждый вызов будет
-        слать system_instruction целиком.
-        """
-        try:
-            cache = self._client.caches.create(
-                model=self.settings.gemini_model,
-                config=types.CreateCachedContentConfig(
-                    system_instruction=self._system_prompt,
-                    ttl=f"{CACHE_TTL_SECONDS}s",
-                ),
-            )
-            self._cache_name = cache.name
-            self._cache_expires_at = time.monotonic() + CACHE_TTL_SECONDS - CACHE_TTL_MARGIN_SECONDS
-            log.info(
-                "Created Gemini context cache: %s (TTL=%ds)",
-                cache.name, CACHE_TTL_SECONDS,
-            )
-        except Exception as err:  # noqa: BLE001
-            log.warning(
-                "Context cache unavailable (%s) — system prompt будет отправляться на каждый вызов",
-                err,
-            )
-            self._cache_name = None
-
-    async def _ensure_cache(self) -> str | None:
-        """Возвращает актуальное имя кэша. Перезаливает, если TTL вот-вот истечёт."""
-        if self._cache_name and time.monotonic() < self._cache_expires_at:
-            return self._cache_name
-        async with self._cache_lock:
-            if self._cache_name and time.monotonic() < self._cache_expires_at:
-                return self._cache_name
-            try:
-                cache = await asyncio.to_thread(
-                    self._client.caches.create,
-                    model=self.settings.gemini_model,
-                    config=types.CreateCachedContentConfig(
-                        system_instruction=self._system_prompt,
-                        ttl=f"{CACHE_TTL_SECONDS}s",
-                    ),
-                )
-                self._cache_name = cache.name
-                self._cache_expires_at = (
-                    time.monotonic() + CACHE_TTL_SECONDS - CACHE_TTL_MARGIN_SECONDS
-                )
-                log.info("Refreshed Gemini context cache: %s", cache.name)
-                return self._cache_name
-            except Exception as err:  # noqa: BLE001
-                log.warning(
-                    "Cache refresh failed (%s) — fallback к system_instruction на этот раз",
-                    err,
-                )
-                self._cache_name = None
-                self._cache_expires_at = 0.0
-                return None
-
-    def _build_config(self, cache_name: str | None) -> types.GenerateContentConfig:
-        if cache_name:
-            return types.GenerateContentConfig(
-                cached_content=cache_name,
-                temperature=0,
-                response_mime_type="application/json",
-            )
-        return types.GenerateContentConfig(
-            system_instruction=self._system_prompt,
-            temperature=0,
-            response_mime_type="application/json",
-        )
 
     async def check(self, contractor: str, date: str, time: str, content: str) -> CheckResult:
         item = BatchItem(id=0, contractor=contractor, date=date, time=time, content=content)
@@ -154,14 +139,13 @@ class LLMClient:
         ]
         user_message = json.dumps(payload, ensure_ascii=False)
 
-        cache_name = await self._ensure_cache()
-        config = self._build_config(cache_name)
-
         raw: str | None = None
         async with self._semaphore:
             try:
-                raw = await self._call_with_retries(user_message, config)
+                raw = await self._call_with_retries(user_message)
             except Exception as err:  # noqa: BLE001
+                if _is_non_retryable_api_error(err):
+                    raise
                 log.warning("Batch call failed entirely (size=%d): %s", len(items), err)
 
         if raw is not None:
@@ -170,14 +154,19 @@ class LLMClient:
                 return parsed
             log.warning("Batch response invalid (size=%d) — falling back to singles", len(items))
 
-        # Fallback: при размере 1 — возвращаем пустой результат, чтобы не входить в рекурсию.
+        # При размере 1 возвращаем пустой результат, чтобы не входить в рекурсию.
         if len(items) == 1:
             return [CheckResult()]
 
         results: list[CheckResult] = []
         for it in items:
-            single = BatchItem(id=0, contractor=it.contractor, date=it.date,
-                               time=it.time, content=it.content)
+            single = BatchItem(
+                id=0,
+                contractor=it.contractor,
+                date=it.date,
+                time=it.time,
+                content=it.content,
+            )
             try:
                 sub = await self.check_batch([single])
                 results.append(sub[0])
@@ -186,25 +175,32 @@ class LLMClient:
                 results.append(CheckResult())
         return results
 
-    async def _call_with_retries(
-        self, user_message: str, config: types.GenerateContentConfig
-    ) -> str:
+    async def _call_with_retries(self, user_message: str) -> str:
         delays = [0, 2, 4]
         last_err: Exception | None = None
         for attempt, delay in enumerate(delays):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                response = await self._client.aio.models.generate_content(
-                    model=self.settings.gemini_model,
-                    contents=user_message,
-                    config=config,
+                response = await self._client.responses.create(
+                    model=self.settings.openai_model,
+                    instructions=self._system_prompt,
+                    input=user_message,
+                    reasoning={"effort": self.settings.openai_reasoning_effort},
+                    text={
+                        "format": _RESPONSE_FORMAT,
+                        "verbosity": "low",
+                    },
+                    store=False,
                 )
-                return response.text or "[]"
+                return response.output_text or '{"results": []}'
             except Exception as err:  # noqa: BLE001
                 last_err = err
-                log.warning("Gemini call failed (attempt %d): %s", attempt + 1, err)
-        raise RuntimeError(f"Gemini call failed after retries: {last_err}")
+                if _is_non_retryable_api_error(err):
+                    log.error("OpenAI request rejected without retry: %s", err)
+                    raise
+                log.warning("OpenAI call failed (attempt %d): %s", attempt + 1, err)
+        raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
 
     def _parse_batch(
         self, raw: str, items: list[BatchItem]
@@ -212,13 +208,21 @@ class LLMClient:
         """Parse batch response. Returns None on any structural issue (→ caller does fallback)."""
         text = raw.strip()
         try:
-            data = json.loads(text) if text else []
+            data = json.loads(text) if text else {}
         except json.JSONDecodeError:
             log.warning("LLM returned non-JSON response: %r", raw[:200])
             return None
 
+        if isinstance(data, dict):
+            data = data.get("results")
+        elif isinstance(data, list):
+            log.debug("Parsing legacy top-level JSON array")
+        else:
+            log.warning("LLM response is not a JSON object: %r", raw[:200])
+            return None
+
         if not isinstance(data, list):
-            log.warning("LLM response is not a JSON array: %r", raw[:200])
+            log.warning("LLM response has no results array: %r", raw[:200])
             return None
 
         if len(data) != len(items):
@@ -254,9 +258,11 @@ class LLMClient:
                 log.warning("Batch element validation failed for id=%d: %s", it.id, err)
                 return None
 
-            if result.corrected == it.content:
+            if result.corrected is not None and _has_only_equivalent_differences(
+                it.content, result.corrected
+            ):
                 log.debug(
-                    "LLM returned identical 'corrected' text for id=%d — dropping changes (%d items)",
+                    "LLM returned only equivalent variants for id=%d — dropping changes (%d items)",
                     it.id,
                     len(result.changes),
                 )

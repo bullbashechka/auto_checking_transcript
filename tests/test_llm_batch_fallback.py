@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-HAS_GENAI = importlib.util.find_spec("google.genai") is not None
+HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
-if HAS_GENAI:
+if HAS_OPENAI:
+    import httpx
+    from openai import BadRequestError
+
     from src.config import Settings
     from src.llm import BatchItem, LLMClient
 
@@ -16,10 +20,11 @@ if HAS_GENAI:
 def _stub_settings() -> "Settings":
     return Settings(
         telegram_token="x",
-        gemini_api_key="x",
+        openai_api_key="x",
         allowed_user_ids=frozenset(),
         allow_any=True,
-        gemini_model="gemini-2.5-flash",
+        openai_model="gpt-5.6-luna",
+        openai_reasoning_effort="low",
         llm_concurrency=1,
     )
 
@@ -31,19 +36,12 @@ def _make_items(n: int) -> list["BatchItem"]:
     ]
 
 
-@unittest.skipUnless(HAS_GENAI, "google-genai not installed — run `pip install -r requirements.txt`")
+@unittest.skipUnless(HAS_OPENAI, "openai not installed — run `pip install -r requirements.txt`")
 class TestCheckBatchFallback(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = patch("src.llm.genai.Client")
+        patcher = patch("src.llm.AsyncOpenAI")
         patcher.start()
         self.addCleanup(patcher.stop)
-        # Отключаем cache-логику — в этих тестах нас интересует только batch/fallback
-        cache_patcher = patch.object(LLMClient, "_try_create_cache_sync")
-        cache_patcher.start()
-        self.addCleanup(cache_patcher.stop)
-        ensure_patcher = patch.object(LLMClient, "_ensure_cache", new=AsyncMock(return_value=None))
-        ensure_patcher.start()
-        self.addCleanup(ensure_patcher.stop)
         self.client = LLMClient(_stub_settings())
 
     def _run(self, coro):
@@ -109,6 +107,45 @@ class TestCheckBatchFallback(unittest.TestCase):
             results = self._run(self.client.check_batch([]))
         self.assertEqual(results, [])
         self.assertEqual(mock.await_count, 0)
+
+    def test_openai_request_uses_luna_and_strict_json(self) -> None:
+        create = AsyncMock(return_value=SimpleNamespace(output_text='{"results": []}'))
+        self.client._client.responses.create = create
+
+        raw = self._run(self.client._call_with_retries("[]"))
+
+        self.assertEqual(raw, '{"results": []}')
+        kwargs = create.await_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(kwargs["reasoning"], {"effort": "low"})
+        self.assertFalse(kwargs["store"])
+        self.assertEqual(kwargs["text"]["format"]["type"], "json_schema")
+        self.assertTrue(kwargs["text"]["format"]["strict"])
+        schema = kwargs["text"]["format"]["schema"]
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["properties"]["results"]["type"], "array")
+
+    def test_bad_request_is_not_retried_or_split_into_singles(self) -> None:
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        )
+        error = BadRequestError("bad schema", response=response, body={})
+        create = AsyncMock(side_effect=error)
+        self.client._client.responses.create = create
+
+        with self.assertRaises(BadRequestError):
+            self._run(self.client._call_with_retries("[]"))
+
+        self.assertEqual(create.await_count, 1)
+
+        mock = AsyncMock(side_effect=error)
+
+        with patch.object(self.client, "_call_with_retries", mock):
+            with self.assertRaises(BadRequestError):
+                self._run(self.client.check_batch(_make_items(3)))
+
+        self.assertEqual(mock.await_count, 1)
 
 
 if __name__ == "__main__":
