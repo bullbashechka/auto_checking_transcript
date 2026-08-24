@@ -12,7 +12,12 @@ HAS_OPENAI = importlib.util.find_spec("openai") is not None
 
 if HAS_OPENAI:
     from src.config import Settings
-    from src.llm import BatchItem, LLMClient
+    from src.llm import (
+        BatchItem,
+        LLMClient,
+        _filter_equivalent_change_descriptions,
+        _restore_equivalent_variants,
+    )
 
 
 def _stub_settings() -> "Settings":
@@ -106,6 +111,83 @@ class TestParseBatch(unittest.TestCase):
         assert results is not None
         self.assertIsNone(results[0].corrected)
         self.assertEqual(results[0].changes, [])
+
+    def test_mixed_correction_preserves_equivalent_variants(self) -> None:
+        items = [
+            BatchItem(
+                id=0,
+                contractor="c",
+                date="01.01.2026",
+                time="09:00",
+                content="Учет в с/х. Опечатка",
+            )
+        ]
+        raw = (
+            '[{"id": 0, "Исправленное_Содержание": "Учёт в СХ. Исправлена", '
+            '"Изменения": ["исправлена опечатка", "заменена буква «ё» на «е»"]}]'
+        )
+        results = self.client._parse_batch(raw, items)
+        assert results is not None
+        self.assertEqual(results[0].corrected, "Учет в с/х. Исправлена")
+        self.assertEqual(results[0].changes, ["исправлена опечатка"])
+
+    def test_long_equivalent_text_is_restored_without_quadratic_alignment(self) -> None:
+        original = "ё" * 16000 + " с/х"
+        corrected = "е" * 16000 + " СХ"
+        self.assertEqual(_restore_equivalent_variants(original, corrected), original)
+
+    def test_whole_word_replacement_does_not_copy_equivalent_letters(self) -> None:
+        self.assertEqual(_restore_equivalent_variants("всё", "лесной"), "лесной")
+        self.assertEqual(_restore_equivalent_variants("ёлка", "зелёный"), "зелёный")
+        self.assertEqual(
+            _restore_equivalent_variants("для всё пользователей", "для всех пользователей"),
+            "для всех пользователей",
+        )
+        self.assertEqual(
+            _restore_equivalent_variants("провёл работы", "проведение работ"),
+            "проведение работ",
+        )
+        self.assertEqual(_restore_equivalent_variants("своё", "своего"), "своего")
+
+    def test_restores_variants_across_punctuation_and_inserted_tokens(self) -> None:
+        self.assertEqual(_restore_equivalent_variants("Учёт,", "Учет."), "Учёт.")
+        self.assertEqual(
+            _restore_equivalent_variants("Учёт данных", "Добавлен полный учет данных"),
+            "Добавлен полный учёт данных",
+        )
+        self.assertEqual(_restore_equivalent_variants("Учёт", "Учетный"), "Учетный")
+
+    def test_does_not_reuse_variant_from_deleted_repeated_token(self) -> None:
+        self.assertEqual(
+            _restore_equivalent_variants("с/х СХ отчет", "СХ отчет"),
+            "СХ отчет",
+        )
+
+    def test_filters_equivalent_clause_but_keeps_real_change(self) -> None:
+        self.assertEqual(
+            _filter_equivalent_change_descriptions(
+                ["исправлена опечатка и заменена буква «ё» на «е»"]
+            ),
+            ["исправлена опечатка"],
+        )
+        self.assertEqual(
+            _filter_equivalent_change_descriptions(["заменено «ё» на «е»"]),
+            [],
+        )
+        self.assertEqual(
+            _filter_equivalent_change_descriptions(["«СХ» заменено на «с/х»"]),
+            [],
+        )
+        self.assertEqual(
+            _filter_equivalent_change_descriptions(["СХ и с/х равнозначны"]),
+            [],
+        )
+        self.assertEqual(
+            _filter_equivalent_change_descriptions(
+                ["исправлена опечатка в термине «с/х»"]
+            ),
+            ["исправлена опечатка в термине «с/х»"],
+        )
 
     def test_invalid_json_returns_none(self) -> None:
         items = _make_items(3)

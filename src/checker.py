@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import xlsx_processor
-from .llm import BATCH_SIZE, BatchItem, CheckResult, LLMClient
+from .llm import (
+    BATCH_SIZE,
+    BatchItem,
+    CheckResult,
+    LLMClient,
+    _filter_equivalent_change_descriptions,
+    _restore_equivalent_variants,
+)
 from .xlsx_processor import Correction, WarningCell, WorkEntry
 
 log = logging.getLogger(__name__)
@@ -39,9 +46,10 @@ _ADDRESS_WITH_SPACES_RE = re.compile(
 )
 _SPACES_AROUND_DOT_RE = re.compile(r" *\. *")
 _REPEATED_PLAIN_SPACES_RE = re.compile(r" {2,}")
-_WORK_BY_NOTICES_RE = re.compile(r"(?i)(\bработа[ \t]+по[ \t]+)извещениям\b")
-_OBLIGATION_BY_NOTICES_RE = re.compile(
-    r"(?i)(\bобязательство[ \t]+по[ \t]+)извещениям\b"
+_NOTICES_WORD_RE = re.compile(r"(?i)(?<!\w)извещениям(?!\w)")
+_WORK_BY_NOTICES_PREFIX_RE = re.compile(r"(?i)(?<!\w)работа\s+по\s+$")
+_OBLIGATION_BY_NOTICES_PREFIX_RE = re.compile(
+    r"(?i)(?<!\w)обязательство\s+по\s+$"
 )
 
 _ADDRESS_SPACING_CHANGE = "исправлены пробелы внутри адреса сайта или email"
@@ -49,6 +57,7 @@ _REPEATED_SPACES_CHANGE = "двойные пробелы заменены одн
 _SENTENCE_SPACING_CHANGE = "добавлен пробел после знака препинания"
 _WORK_BY_NOTICES_CHANGE = "уточнён регистр «Извещениям» в формулировке работы"
 _OBLIGATION_BY_NOTICES_CHANGE = "уточнён регистр «извещениям» в названии документа"
+_NOTICES_CHANGE = "уточнён регистр «Извещениям»"
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
@@ -125,20 +134,27 @@ def _normalize_mechanical_spacing(text: str) -> tuple[str, list[str]]:
 
 
 def _normalize_contextual_notices_case(text: str) -> tuple[str, list[str]]:
-    """Нормализует регистр «извещениям» в двух согласованных формулировках."""
+    """Пишет «извещениям» строчными только в названии обязательства."""
     changes: list[str] = []
 
-    work_text, work_count = _WORK_BY_NOTICES_RE.subn(r"\1Извещениям", text)
-    if work_count:
-        changes.append(_WORK_BY_NOTICES_CHANGE)
+    def replace(match: re.Match[str]) -> str:
+        prefix = text[: match.start()]
+        if _OBLIGATION_BY_NOTICES_PREFIX_RE.search(prefix):
+            expected = "извещениям"
+            change = _OBLIGATION_BY_NOTICES_CHANGE
+        elif _WORK_BY_NOTICES_PREFIX_RE.search(prefix):
+            expected = "Извещениям"
+            change = _WORK_BY_NOTICES_CHANGE
+        else:
+            expected = "Извещениям"
+            change = _NOTICES_CHANGE
 
-    obligation_text, obligation_count = _OBLIGATION_BY_NOTICES_RE.subn(
-        r"\1извещениям", work_text
-    )
-    if obligation_count:
-        changes.append(_OBLIGATION_BY_NOTICES_CHANGE)
+        if match.group(0) != expected:
+            changes.append(change)
+        return expected
 
-    return obligation_text, changes
+    fixed = _NOTICES_WORD_RE.sub(replace, text)
+    return fixed, _merge_unique_changes(changes)
 
 
 def _normalize_input_text(text: str) -> tuple[str, list[str]]:
@@ -275,12 +291,19 @@ async def process_file(
 
         pre_normalized_text, pre_changes = normalized_inputs[entry.row_idx]
         base_text = result.corrected if result.corrected else pre_normalized_text
+        model_changes = list(result.changes)
+        if result.corrected:
+            base_text = _restore_equivalent_variants(pre_normalized_text, base_text)
+            if base_text == pre_normalized_text:
+                model_changes = []
+            elif base_text != result.corrected:
+                model_changes = _filter_equivalent_change_descriptions(model_changes)
         spaced_text, post_changes = _normalize_mechanical_spacing(base_text)
         contextual_text, post_contextual_changes = _normalize_contextual_notices_case(spaced_text)
         initials_text, initials_normalized = _normalize_surname_initials(contextual_text)
         final_text, dot_added = _ensure_trailing_dot(initials_text)
         changes = _merge_unique_changes(
-            pre_changes, list(result.changes), post_changes, post_contextual_changes
+            pre_changes, model_changes, post_changes, post_contextual_changes
         )
         if initials_normalized:
             changes = _merge_unique_changes(

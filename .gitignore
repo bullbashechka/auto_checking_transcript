@@ -6,6 +6,7 @@ venv/
 .worktrees/
 .idea/
 .vscode/
+.claude/settings.local.json
 *.xlsx
 !.gitkeep
 

@@ -88,8 +88,8 @@ class TestPromptContract(unittest.TestCase):
         for fragment in (
             "«е» и «ё», а также «Е» и «Ё», равнозначны",
             "«СХ» и «с/х» равнозначны",
-            "«Работа по Извещениям»",
             "«Обязательство по извещениям»",
+            "Во всех остальных контекстах используй «Извещениям»",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.prompt)

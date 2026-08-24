@@ -149,13 +149,21 @@ class TestCheckerBatching(unittest.TestCase):
 
     def test_normalizes_contextual_notices_before_llm_and_in_report(self) -> None:
         path = _make_workbook_with_contents(
-            ["Работа  по извещениям", "Обязательство по Извещениям"]
+            [
+                "Работа  по извещениям",
+                "Обязательство по Извещениям",
+                "Проверка по извещениям",
+            ]
         )
 
         async def side_effect(items):
             self.assertEqual(
                 [item.content for item in items],
-                ["Работа по Извещениям", "Обязательство по извещениям"],
+                [
+                    "Работа по Извещениям",
+                    "Обязательство по извещениям",
+                    "Проверка по Извещениям",
+                ],
             )
             return [CheckResult() for _ in items]
 
@@ -163,7 +171,7 @@ class TestCheckerBatching(unittest.TestCase):
         mock_llm.check_batch.side_effect = side_effect
         output_path, report = self._run(checker.process_file(path, mock_llm))
 
-        self.assertEqual(len(report.corrections), 2)
+        self.assertEqual(len(report.corrections), 3)
         work_changes = report.corrections[0][1]
         obligation_changes = report.corrections[1][1]
         self.assertIn("двойные пробелы заменены одним", work_changes)
@@ -171,11 +179,14 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertIn(
             "уточнён регистр «извещениям» в названии документа", obligation_changes
         )
+        other_changes = report.corrections[2][1]
+        self.assertIn("уточнён регистр «Извещениям»", other_changes)
         written_wb = load_workbook(output_path)
         self.assertEqual(written_wb.active["E4"].value, "Работа по Извещениям.")
         self.assertEqual(
             written_wb.active["E6"].value, "Обязательство по извещениям."
         )
+        self.assertEqual(written_wb.active["E8"].value, "Проверка по Извещениям.")
 
     def test_normalizes_llm_output_and_merges_changes_without_duplicates(self) -> None:
         path = _make_workbook_with_contents(["Проверка openai. com"])
@@ -201,6 +212,30 @@ class TestCheckerBatching(unittest.TestCase):
         self.assertEqual(changes.count("двойные пробелы заменены одним"), 1)
         self.assertIn("добавлено слово «выполнена»", changes)
         self.assertIn("добавлена точка в конце", changes)
+
+    def test_preserves_equivalent_variants_when_llm_also_corrects(self) -> None:
+        path = _make_workbook_with_contents(["Учет в с/х. Опечатка"])
+
+        async def side_effect(items):
+            return [
+                CheckResult(
+                    corrected="Учёт в СХ. Исправлена",
+                    changes=["исправлена опечатка", "заменено ё на е"],
+                )
+                for _item in items
+            ]
+
+        mock_llm = AsyncMock()
+        mock_llm.check_batch.side_effect = side_effect
+        output_path, report = self._run(checker.process_file(path, mock_llm))
+
+        self.assertEqual(len(report.corrections), 1)
+        self.assertIn("исправлена опечатка", report.corrections[0][1])
+        self.assertFalse(any("ё" in change or "СХ" in change for change in report.corrections[0][1]))
+        self.assertEqual(
+            load_workbook(output_path).active["E4"].value,
+            "Учет в с/х. Исправлена.",
+        )
 
     def test_preserves_entry_order(self) -> None:
         path = _make_workbook_with_entries(7)

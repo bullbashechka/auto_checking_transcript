@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from difflib import SequenceMatcher
 import json
 import logging
 import re
@@ -56,6 +58,18 @@ _RESPONSE_FORMAT: dict[str, Any] = {
 }
 
 _EQUIVALENT_ABBREVIATION_RE = re.compile(r"(?<![\w/])(?:СХ|с/х)(?![\w/])")
+_EQUIVALENT_CHAR_TRANSLATION = str.maketrans({"Ё": "Е", "ё": "е"})
+_SEMANTIC_TOKEN_RE = re.compile(
+    r"(?<![\w/])(?:СХ|с/х)(?![\w/])|[^\W_]+|[^\w\s]+"
+)
+_EQUIVALENT_VARIANT_RE = r"(?:\b[её]\b|\bсх\b|с/х)"
+_MAX_TOKEN_ALIGNMENT = 2048
+_EQUIVALENT_CHANGE_DESCRIPTION_RE = re.compile(
+    rf"(?:{_EQUIVALENT_VARIANT_RE}.*?(?:/|↔|→|\bна\b).*?{_EQUIVALENT_VARIANT_RE}"
+    rf"|(?:равнознач|эквивалент).*?{_EQUIVALENT_VARIANT_RE}"
+    rf"|{_EQUIVALENT_VARIANT_RE}.*?(?:равнознач|эквивалент))",
+    re.IGNORECASE,
+)
 
 
 def _is_non_retryable_api_error(err: Exception) -> bool:
@@ -68,14 +82,138 @@ def _is_non_retryable_api_error(err: Exception) -> bool:
 
 def _canonicalize_equivalent_variants(text: str) -> str:
     """Сводит допустимые варианты е/ё и СХ/с/х для сравнения ответов LLM."""
-    with_plain_e = text.replace("Ё", "Е").replace("ё", "е")
+    with_plain_e = text.translate(_EQUIVALENT_CHAR_TRANSLATION)
     return _EQUIVALENT_ABBREVIATION_RE.sub("СХ", with_plain_e)
 
 
-def _has_only_equivalent_differences(original: str, corrected: str) -> bool:
-    return _canonicalize_equivalent_variants(original) == _canonicalize_equivalent_variants(
-        corrected
-    )
+def _filter_equivalent_change_descriptions(changes: list[str]) -> list[str]:
+    """Remove equivalent-variant clauses while retaining real corrections."""
+    filtered: list[str] = []
+    for change in changes:
+        parts = re.split(
+            rf"\s*(?:;|,)\s*|\s+и\s+(?!(?:{_EQUIVALENT_VARIANT_RE})\s+"
+            rf"(?:равнознач|эквивалент))",
+            change,
+            flags=re.IGNORECASE,
+        )
+        retained = [
+            part.strip()
+            for part in parts
+            if part.strip()
+            and not _EQUIVALENT_CHANGE_DESCRIPTION_RE.search(part)
+        ]
+        if retained:
+            filtered.append(" и ".join(retained))
+    return filtered
+
+
+def _canonical_token(text: str) -> str:
+    return _canonicalize_equivalent_variants(text).casefold()
+
+
+def _tokenize_semantic_text(text: str) -> list[tuple[int, int, str, str]]:
+    return [
+        (match.start(), match.end(), match.group(0), _canonical_token(match.group(0)))
+        for match in _SEMANTIC_TOKEN_RE.finditer(text)
+    ]
+
+
+def _restore_equivalent_variant_in_token(original: str, corrected: str) -> str:
+    """Restore variants only when the complete semantic token is unchanged."""
+    if _canonical_token(original) != _canonical_token(corrected):
+        return corrected
+    if (
+        _EQUIVALENT_ABBREVIATION_RE.fullmatch(original)
+        and _EQUIVALENT_ABBREVIATION_RE.fullmatch(corrected)
+    ):
+        return original
+    if len(original) != len(corrected):
+        return corrected
+    restored = list(corrected)
+    for index, (original_char, corrected_char) in enumerate(zip(original, corrected)):
+        if (
+            original_char in "ЕЁеё"
+            and corrected_char in "ЕЁеё"
+            and original_char.translate(_EQUIVALENT_CHAR_TRANSLATION).casefold()
+            == corrected_char.translate(_EQUIVALENT_CHAR_TRANSLATION).casefold()
+        ):
+            restored[index] = (
+                original_char.upper() if corrected_char.isupper() else original_char.lower()
+            )
+    return "".join(restored)
+
+
+def _token_alignment_pairs(
+    original_tokens: list[tuple[int, int, str, str]],
+    corrected_tokens: list[tuple[int, int, str, str]],
+) -> list[tuple[int, int]]:
+    original_keys = [token[3] for token in original_tokens]
+    corrected_keys = [token[3] for token in corrected_tokens]
+    if max(len(original_keys), len(corrected_keys)) <= _MAX_TOKEN_ALIGNMENT:
+        matcher = SequenceMatcher(a=original_keys, b=corrected_keys, autojunk=False)
+        return [
+            (original_start + offset, corrected_start + offset)
+            for original_start, corrected_start, size in matcher.get_matching_blocks()
+            for offset in range(size)
+        ]
+
+    pairs: list[tuple[int, int]] = []
+    original_index = 0
+    corrected_index = 0
+    while original_index < len(original_keys) and corrected_index < len(corrected_keys):
+        if original_keys[original_index] == corrected_keys[corrected_index]:
+            pairs.append((original_index, corrected_index))
+            original_index += 1
+            corrected_index += 1
+        elif (
+            original_index + 1 < len(original_keys)
+            and original_keys[original_index + 1] == corrected_keys[corrected_index]
+        ):
+            original_index += 1
+        elif (
+            corrected_index + 1 < len(corrected_keys)
+            and original_keys[original_index] == corrected_keys[corrected_index + 1]
+        ):
+            corrected_index += 1
+        else:
+            original_index += 1
+            corrected_index += 1
+    return pairs
+
+
+def _restore_equivalent_variants(original: str, corrected: str) -> str:
+    """Restore the author's е/ё and СХ/с/х variants after other edits."""
+    original_tokens = _tokenize_semantic_text(original)
+    corrected_tokens = _tokenize_semantic_text(corrected)
+    if not original_tokens or not corrected_tokens:
+        return corrected
+
+    original_counts = Counter(token[3] for token in original_tokens)
+    corrected_counts = Counter(token[3] for token in corrected_tokens)
+    restorable_keys = {
+        key for key, count in original_counts.items() if corrected_counts.get(key) == count
+    }
+    replacements: dict[int, str] = {}
+    alignment_pairs = _token_alignment_pairs(original_tokens, corrected_tokens)
+    for original_index, corrected_index in alignment_pairs:
+        original_token = original_tokens[original_index]
+        corrected_token = corrected_tokens[corrected_index]
+        if original_token[3] not in restorable_keys:
+            continue
+        replacement = _restore_equivalent_variant_in_token(
+            original_token[2], corrected_token[2]
+        )
+        if replacement != corrected_token[2]:
+            replacements[corrected_index] = replacement
+
+    pieces: list[str] = []
+    cursor = 0
+    for index, (start, end, raw, _canonical) in enumerate(corrected_tokens):
+        pieces.append(corrected[cursor:start])
+        pieces.append(replacements.get(index, raw))
+        cursor = end
+    pieces.append(corrected[cursor:])
+    return "".join(pieces)
 
 
 @dataclass(frozen=True)
@@ -258,18 +396,25 @@ class LLMClient:
                 log.warning("Batch element validation failed for id=%d: %s", it.id, err)
                 return None
 
-            if result.corrected is not None and _has_only_equivalent_differences(
-                it.content, result.corrected
-            ):
-                log.debug(
-                    "LLM returned only equivalent variants for id=%d — dropping changes (%d items)",
-                    it.id,
-                    len(result.changes),
-                )
-                result = CheckResult(
-                    corrected=None,
-                    changes=[],
-                    warning=result.warning,
-                )
+            if result.corrected is not None:
+                restored = _restore_equivalent_variants(it.content, result.corrected)
+                if restored == it.content:
+                    log.debug(
+                        "LLM returned only equivalent variants for id=%d — dropping changes (%d items)",
+                        it.id,
+                        len(result.changes),
+                    )
+                    result = CheckResult(
+                        corrected=None,
+                        changes=[],
+                        warning=result.warning,
+                    )
+                elif restored != result.corrected:
+                    result = CheckResult(
+                        corrected=restored,
+                        changes=_filter_equivalent_change_descriptions(result.changes),
+                        warning=result.warning,
+                    )
+
             results.append(result)
         return results
