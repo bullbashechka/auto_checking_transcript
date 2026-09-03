@@ -58,6 +58,17 @@ class TestPromptContract(unittest.TestCase):
 
         self.assertNotIn("«1кв.» → «1 кв.»,", self.prompt)
 
+    def test_contains_form_number_and_reporting_period_rules(self) -> None:
+        for fragment in (
+            "«300 ф.» → «300ф.»",
+            "«300.00 ф.» → «300.00ф.»",
+            "«ф.300.00» не меняй",
+            "«2кв.2026г.» → «2кв. 2026г.»",
+            "«5 т.» оставляй как есть",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.prompt)
+
     def test_allows_both_1c_webkassa_spellings(self) -> None:
         self.assertIn(
             "«1C:WebKassa» с латинской C и «1С:WebKassa» с кириллической С "

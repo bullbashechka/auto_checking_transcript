@@ -49,6 +49,45 @@ class TestTextNormalization(unittest.TestCase):
                 self.assertEqual(fixed, expected)
                 self.assertEqual(changes, [] if change is None else [change])
 
+    def test_normalizes_form_number_spacing(self) -> None:
+        cases = {
+            "300 ф.": "300ф.",
+            "300.00 ф.": "300.00ф.",
+            "300ф.": "300ф.",
+            "ф.300.00": "ф.300.00",
+            "5 т.": "5 т.",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                fixed, _changes = checker._normalize_form_and_period_spacing(source)
+                self.assertEqual(fixed, expected)
+
+    def test_normalizes_quarter_year_spacing(self) -> None:
+        cases = {
+            "2кв.2026г.": "2кв. 2026г.",
+            "2 кв.2026 г.": "2кв. 2026г.",
+            "2 кв. 2026 г.": "2кв. 2026г.",
+            "1кв. 2026г.": "1кв. 2026г.",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                fixed, _changes = checker._normalize_form_and_period_spacing(source)
+                self.assertEqual(fixed, expected)
+
+    def test_normalizes_user_example_before_llm(self) -> None:
+        source = (
+            "Вопросы по заполнению ЭДВС (остатки) для оприходования источников "
+            "происхождения с NTIN, по заполнению 300 ф. за 2кв.2026г. в ИБ"
+        )
+        expected = (
+            "Вопросы по заполнению ЭДВС (остатки) для оприходования источников "
+            "происхождения с NTIN, по заполнению 300ф. за 2кв. 2026г. в ИБ"
+        )
+        fixed, changes = checker._normalize_input_text(source)
+        self.assertEqual(fixed, expected)
+        self.assertIn("убран пробел между номером формы и сокращением «ф.»", changes)
+        self.assertIn("нормализована запись отчётного периода", changes)
+
     def test_preserves_tabs_and_newlines(self) -> None:
         source = "один\t\tдва\n\nтри"
         fixed, changes = checker._normalize_mechanical_spacing(source)

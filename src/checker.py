@@ -20,6 +20,11 @@ from .xlsx_processor import Correction, WarningCell, WorkEntry
 
 log = logging.getLogger(__name__)
 
+_FORM_NUMBER_SPACING_RE = re.compile(r"(?<!\w)(\d+(?:[.,]\d+)?) +ф\.", re.IGNORECASE)
+_QUARTER_NUMBER_SPACING_RE = re.compile(r"(?<!\w)([1-4]) +кв\.", re.IGNORECASE)
+_QUARTER_YEAR_SPACING_RE = re.compile(r"(?<!\w)([1-4]кв\.) *(\d{4})", re.IGNORECASE)
+_YEAR_ABBREVIATION_SPACING_RE = re.compile(r"(?<!\w)(\d{4}) +г\.", re.IGNORECASE)
+
 _TRAILING_PUNCT = {".", "!", "?", "…"}
 _SPACE_AFTER_PUNCT_RE = re.compile(r"([.!?…])([ \t]*)([A-Za-zА-Яа-яЁё])")
 _SURNAME_INITIALS_SPACING_RE = re.compile(r"\b([А-ЯЁ][а-яё]+)\s+([А-ЯЁ])\.\s+([А-ЯЁ])\.")
@@ -58,6 +63,8 @@ _SENTENCE_SPACING_CHANGE = "добавлен пробел после знака 
 _WORK_BY_NOTICES_CHANGE = "уточнён регистр «Извещениям» в формулировке работы"
 _OBLIGATION_BY_NOTICES_CHANGE = "уточнён регистр «извещениям» в названии документа"
 _NOTICES_CHANGE = "уточнён регистр «Извещениям»"
+_FORM_NUMBER_SPACING_CHANGE = "убран пробел между номером формы и сокращением «ф.»"
+_REPORTING_PERIOD_SPACING_CHANGE = "нормализована запись отчётного периода"
 
 ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 
@@ -133,6 +140,23 @@ def _normalize_mechanical_spacing(text: str) -> tuple[str, list[str]]:
     return sentence_text, changes
 
 
+def _normalize_form_and_period_spacing(text: str) -> tuple[str, list[str]]:
+    """Приводит номера форм и отчётные периоды к каноническому виду."""
+    changes: list[str] = []
+
+    form_text = _FORM_NUMBER_SPACING_RE.sub(r"\1ф.", text)
+    if form_text != text:
+        changes.append(_FORM_NUMBER_SPACING_CHANGE)
+
+    period_text = _QUARTER_NUMBER_SPACING_RE.sub(r"\1кв.", form_text)
+    period_text = _QUARTER_YEAR_SPACING_RE.sub(r"\1 \2", period_text)
+    period_text = _YEAR_ABBREVIATION_SPACING_RE.sub(r"\1г.", period_text)
+    if period_text != form_text:
+        changes.append(_REPORTING_PERIOD_SPACING_CHANGE)
+
+    return period_text, changes
+
+
 def _normalize_contextual_notices_case(text: str) -> tuple[str, list[str]]:
     """Пишет «извещениям» строчными только в названии обязательства."""
     changes: list[str] = []
@@ -159,8 +183,11 @@ def _normalize_contextual_notices_case(text: str) -> tuple[str, list[str]]:
 
 def _normalize_input_text(text: str) -> tuple[str, list[str]]:
     spaced_text, spacing_changes = _normalize_mechanical_spacing(text)
-    contextual_text, contextual_changes = _normalize_contextual_notices_case(spaced_text)
-    return contextual_text, _merge_unique_changes(spacing_changes, contextual_changes)
+    formatted_text, formatting_changes = _normalize_form_and_period_spacing(spaced_text)
+    contextual_text, contextual_changes = _normalize_contextual_notices_case(formatted_text)
+    return contextual_text, _merge_unique_changes(
+        spacing_changes, formatting_changes, contextual_changes
+    )
 
 
 def _normalize_surname_initials(text: str) -> tuple[str, bool]:
@@ -299,11 +326,20 @@ async def process_file(
             elif base_text != result.corrected:
                 model_changes = _filter_equivalent_change_descriptions(model_changes)
         spaced_text, post_changes = _normalize_mechanical_spacing(base_text)
-        contextual_text, post_contextual_changes = _normalize_contextual_notices_case(spaced_text)
+        formatted_text, post_formatting_changes = _normalize_form_and_period_spacing(
+            spaced_text
+        )
+        contextual_text, post_contextual_changes = _normalize_contextual_notices_case(
+            formatted_text
+        )
         initials_text, initials_normalized = _normalize_surname_initials(contextual_text)
         final_text, dot_added = _ensure_trailing_dot(initials_text)
         changes = _merge_unique_changes(
-            pre_changes, model_changes, post_changes, post_contextual_changes
+            pre_changes,
+            model_changes,
+            post_changes,
+            post_formatting_changes,
+            post_contextual_changes,
         )
         if initials_normalized:
             changes = _merge_unique_changes(

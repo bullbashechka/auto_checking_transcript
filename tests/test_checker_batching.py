@@ -187,6 +187,41 @@ class TestCheckerBatching(unittest.TestCase):
         )
         self.assertEqual(written_wb.active["E8"].value, "Проверка по Извещениям.")
 
+    def test_normalizes_forms_and_periods_before_and_after_llm(self) -> None:
+        source = (
+            "Вопросы по заполнению ЭДВС (остатки) для оприходования источников "
+            "происхождения с NTIN, по заполнению 300 ф. за 2кв.2026г. в ИБ"
+        )
+        expected_for_llm = (
+            "Вопросы по заполнению ЭДВС (остатки) для оприходования источников "
+            "происхождения с NTIN, по заполнению 300ф. за 2кв. 2026г. в ИБ"
+        )
+        path = _make_workbook_with_contents([source])
+
+        async def side_effect(items):
+            self.assertEqual(items[0].content, expected_for_llm)
+            return [CheckResult(corrected=source)]
+
+        mock_llm = AsyncMock()
+        mock_llm.check_batch.side_effect = side_effect
+        output_path, report = self._run(checker.process_file(path, mock_llm))
+
+        self.assertEqual(len(report.corrections), 1)
+        _entry, changes = report.corrections[0]
+        self.assertEqual(
+            changes.count("убран пробел между номером формы и сокращением «ф.»"),
+            1,
+        )
+        self.assertEqual(
+            changes.count("нормализована запись отчётного периода"),
+            1,
+        )
+        written_wb = load_workbook(output_path)
+        self.assertEqual(
+            written_wb.active["E4"].value,
+            expected_for_llm + ".",
+        )
+
     def test_normalizes_llm_output_and_merges_changes_without_duplicates(self) -> None:
         path = _make_workbook_with_contents(["Проверка openai. com"])
 
